@@ -1,32 +1,47 @@
-# lab
+# Distributed Agentic Infrastructure & Orchestration Lab
 
 ---
 
-# DevSecOps Kubernetes Lab
+A living Research and Development (R&D) lab focused on engineering declarative infrastructure, zero-trust network policies, and distributed control planes optimized for multi-agent LLM workloads. This repository serves as an open workspace for mapping out microservice patterns, container orchestration, and hardware-accelerated edge nodes acting in concert as an autonomous processing mesh.
 
-A living, hands-on lab for rebuilding and advancing my Kubernetes, DevOps, and security engineering skills.
-
----
-
-## Overview
-
-This repository serves as an active engineering lab focused on:
-
-* Rebuilding Kubernetes proficiency from the ground up
-* Applying DevSecOps practices in realistic environments
-* Moving from theory to implementation through hands-on work
-* Maintaining a public, evolving portfolio of technical capability
-
-This is not a finished project. It is a continuously evolving lab environment.
+> **⚠️ COMPUTE RESOURCE DISCLAIMER & RISK WARNING**
+> This repository contains highly experimental, concurrent, and resource-intensive infrastructure blueprints. Executing these configurations, provisioning parallel compute huddles, or spinning up local model inference engines requires substantial VRAM and compute allocations. Replicate, deploy, and execute these components within your own environments strictly **at your own risk**. Monitor your hardware thermals and cloud subscription metrics closely.
 
 ---
 
-## Current Focus
+## Architectural Focus & Direction
 
-* Kubernetes fundamentals (pods, deployments, services, networking)
-* Rebuilding concepts from ongoing training and practical exercises
-* Creating reproducible local cluster environments
-* Deploying and testing applications within Kubernetes
+Traditional Kubernetes and microservice ecosystems are optimized for stateless web applications[cite: 116]. This lab explores the architectural paradigm shift required when the workload shifts to memory-heavy, stateful, and non-deterministic **Multi-Agent AI Workflows**.
+
+Current development streams are steering heavily away from monolithic sequential prompting patterns and moving toward **Parallel Agent Hives** managed via distributed task queues.
+
+
+```
+
++-------------------------------------------------------------------------+
+|                        CENTRAL CONTROL PLANE                            |
+|             (Task Coordinator / Asynchronous Event Queue)               |
++-------------------------------------------------------------------------+
+|
+Dynamic Ingress Routing & Concurrency Throttling (mTLS)          |
+|                                    |
++---------------------------+---------------------------+        |
+|                           |                           |        |
+v                           v                           v        v
++-----------------+         +-----------------+         +-----------------+
+| AGENT STAGE 01  |         | AGENT STAGE 02  |         | AGENT STAGE 03  |
+| (10-Node Hive)  |         | (10-Node Hive)  |         | (10-Node Hive)  |
++-----------------+         +-----------------+         +-----------------+
+|  VRAM Contention|         |  VRAM Contention|         |  VRAM Contention|
+|  & Context Lock |         |  & Context Lock |         |  & Context Lock |
++-----------------+         +-----------------+         +-----------------+
+```
+
+### R&D Log: Hive Scalability Bottlenecks & Discovery
+During high-density scaling trials within localized cluster environments, significant architectural flaws were uncovered when operating massive parallel multi-agent configurations at scale (specifically staging **10 active nodes running concurrently per pipeline phase**).
+
+* **The Bottleneck:** Massive parallel execution loops trigger localized token serialization bottlenecks, upstream API rate limit blocks, or severe local VRAM allocation thrashing when context windows expand simultaneously.
+* **The Remediation Vector:** Current R&D is focused on implementing a deterministic backoff state machine, asynchronous token-bucket queue mechanics, and dynamic ACPI power orchestration to safely sleep or wake hardware nodes based on live queue depths.
 
 ---
 
@@ -34,110 +49,45 @@ This is not a finished project. It is a continuously evolving lab environment.
 
 ```bash
 .
-├── k8s/
-│   ├── manifests/        # Core Kubernetes YAML (pods, deployments, services)
-│   ├── networking/       # Services, ingress, network policies
-│   └── security/         # RBAC, policies, secrets handling
+├── architecture/             # Active design documents, RFCs, and systemic logic logs
+│   └── RFC-001-agent-mesh.md # Architectural brainstorming for multi-agent state tracks
 │
-├── apps/
-│   └── sample-app/       # Test applications deployed into the cluster
+├── infrastructure/           # Declarative local cluster configurations
+│   ├── k3s-cluster/          # Hardened k3s/k3d blueprints for control plane testing
+│   └── compute-nodes/        # Abstracted topology maps for multi-node clusters
 │
-├── infrastructure/
-│   └── local-cluster/    # k3d / kind / minikube setups
+├── core-engines/             # Sanitized, modular processing components
+│   ├── orchestrator/         # Python/Go task broker handlers and error-state logic
+│   └── gateways/             # Webhook validation wrappers and decoupled API interfaces
 │
-├── devsecops/
-│   ├── ci-cd/            # Pipeline configurations (planned)
-│   ├── scanning/         # Security scanning tools (planned)
-│   └── policies/         # Security enforcement (planned)
-│
-└── docs/
-    └── notes/            # Learning notes, breakdowns, and lessons learned
+└── devsecops/                # Security posture, automated scanning, and RBAC
+    ├── ci-cd/                # GitHub Actions linting and testing pipelines (Planned)
+    ├── policies/             # NetworkPolicies to isolate agent container runtimes
+    └── scanning/             # Automated container scanning configuration (Planned)
+
 ```
+---
+
+## Active Roadmap & Iteration Log
+
+* [x] Establish parameterized, multi-node infrastructure abstracts.
+* [ ] Commit sanitized Python asynchronous core orchestrator skeleton.
+* [ ] Integrate declarative Kubernetes `NetworkPolicies` to enforce strict zero-trust isolation boundaries between processing agent pods.
+* [ ] Document failure mechanics of 10-node parallel worker groups under heavy context window serialization.
+* [ ] Introduce local hardware state management scripts (Dynamic Ephemeral Provisioning via Wake-on-LAN/IPMI).
+* [ ] Deploy Helm charts for centralized cluster telemetry (Prometheus/Grafana log monitoring metrics).
 
 ---
 
-## DevSecOps Direction
+## Tech Stack Focus
 
-This lab will progressively incorporate:
-
-* CI/CD pipelines (GitHub Actions)
-* Container and dependency scanning
-* Kubernetes security (RBAC, NetworkPolicies)
-* Secrets management (e.g., Vault, sealed secrets)
-* Observability (Prometheus, Grafana, SigNoz)
+* **Orchestration & Containerization:** Kubernetes (k3s, k3d, Proxmox VE VirtIO mapping)
+* **Configuration & IaC:** Terraform, Ansible Playbooks
+* **Runtime Automation:** Python (Asynchronous I/O, event-driven loop architectures)
+* **Local Inference Engines:** Ollama, vLLM Core APIs
 
 ---
 
-## Approach
+## Feedback & Collaboration
 
-* Learn by building, not just consuming material
-* Intentionally break and rebuild systems to understand behavior
-* Apply production-minded practices where feasible
-* Document decisions, failures, and improvements
-
----
-
-## Purpose
-
-Working in a security-focused role, I identified a need to rebuild hands-on development and infrastructure skills.
-
-This repository exists to:
-
-* Strengthen engineering depth
-* Provide visible, demonstrable work
-* Bridge Security, DevOps, and Software Engineering
-
----
-
-## Roadmap
-
-* [ ] Rebuild Kubernetes core concepts
-* [ ] Deploy applications with proper networking
-* [ ] Introduce CI/CD pipelines
-* [ ] Implement container and dependency scanning
-* [ ] Add infrastructure as code (Terraform)
-* [ ] Integrate observability tooling
-* [ ] Simulate real-world DevSecOps scenarios
-
----
-
-## Tech Stack
-
-* Kubernetes (k3d / kind / minikube)
-* Docker
-* Helm (planned)
-* Terraform (planned)
-* GitHub Actions (planned)
-* Trivy or similar tools (planned)
-* Prometheus / Grafana (planned)
-* SigNoz (planned)
-
----
-
-## Documentation
-
-The `/docs` directory includes:
-
-* Learning notes
-* Experiment breakdowns
-* Failure analysis and resolutions
-
----
-
-## Feedback
-
-Suggestions and feedback are welcome.
-
----
-
-## Disclaimer
-
-This repository is a learning and experimentation environment. Not all configurations are production-hardened.
-
----
-
-## Personal Note
-
-I focus on building systems that evolve through iteration and refinement. This lab reflects that approach.
-
-
+This is a live, iterative research environment. Structural insights, issue logging, and architectural discussions regarding distributed state management or token-bucket throughput optimization are welcome.
