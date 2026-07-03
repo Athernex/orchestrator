@@ -14,8 +14,8 @@
     "ALLOW_DIRTY_START": "true",
     "AUTO_COMMIT": "true",
     "PUSH_BRANCH": "true",
-    "REMOTE_NAME": "origin",
-    "ALLOWED_REMOTE_REPO": "CharlesDerek/lab",
+    "REMOTE_NAME": "athernex",
+    "ALLOWED_REMOTE_REPO": "Athernex/orchestrator",
     "COMMIT_MESSAGE_PREFIX": "chore: neuroplexis maintenance"
   },
   "variables": [

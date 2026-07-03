@@ -73,6 +73,13 @@ make run-paperclip
 
 The official Paperclip dashboard runs on port `3100` by default. This machine is configured for authenticated private-network access, so use `http://127.0.0.1:3100/`, a LAN address, or a Tailscale address allowed by the host firewall.
 
+Git remotes are split by role:
+
+- `origin`: personal R&D source, `git@github.com:CharlesDerek/lab.git`
+- `athernex`: public downstream orchestrator repo, `git@github.com:Athernex/orchestrator.git`
+
+Scheduled routine pushes are guarded by an allowlist and target the `athernex` remote.
+
 Run the local Codex scheduler bridge:
 
 ```bash
