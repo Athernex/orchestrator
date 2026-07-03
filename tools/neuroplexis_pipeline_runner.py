@@ -137,10 +137,19 @@ def scan_staged_files(ctx: PipelineContext) -> None:
 
 def prepare_branch(ctx: PipelineContext) -> None:
     base_branch = ctx.config.get("baseBranch", "development")
+    downstream_remote = ctx.config.get("downstreamRemoteName", "athernex")
+    downstream_branch = ctx.config.get("downstreamBranch", "retrospective")
     run(["git", "fetch", "--all", "--prune"], ctx.repo_root)
     run(["git", "switch", base_branch], ctx.repo_root, check=True)
     run(["git", "pull", "--ff-only"], ctx.repo_root)
     run(["git", "switch", "-c", ctx.branch_name], ctx.repo_root, check=True)
+    downstream_ref = f"refs/remotes/{downstream_remote}/{downstream_branch}"
+    ref_check = run(["git", "show-ref", "--verify", "--quiet", downstream_ref], ctx.repo_root)
+    if ref_check.returncode == 0:
+        write_log(ctx, f"fast-forwarding branch from {downstream_remote}/{downstream_branch}")
+        run(["git", "merge", "--ff-only", f"{downstream_remote}/{downstream_branch}"], ctx.repo_root, check=True)
+    else:
+        write_log(ctx, f"downstream branch {downstream_remote}/{downstream_branch} not found; first run will create it")
 
 
 def task_codex(ctx: PipelineContext, task: dict[str, Any]) -> None:

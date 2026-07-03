@@ -193,6 +193,12 @@ git fetch --all --prune >"$run_dir/git-fetch.stdout.log" 2>"$run_dir/git-fetch.s
 git switch "$BASE_BRANCH"
 git pull --ff-only || true
 git switch -c "$branch_name"
+if git show-ref --verify --quiet "refs/remotes/$DOWNSTREAM_REMOTE/$DOWNSTREAM_BRANCH"; then
+  log "fast-forwarding routine branch from $DOWNSTREAM_REMOTE/$DOWNSTREAM_BRANCH"
+  git merge --ff-only "$DOWNSTREAM_REMOTE/$DOWNSTREAM_BRANCH"
+else
+  log "downstream branch $DOWNSTREAM_REMOTE/$DOWNSTREAM_BRANCH not found; first run will create it"
+fi
 
 cat >"$run_dir/next-context.md" <<EOF
 # Neuroplexis Lab Maintenance Context
