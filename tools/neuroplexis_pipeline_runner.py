@@ -283,8 +283,13 @@ def execute(config_path: Path, dry_run: bool) -> int:
             prepare_branch(ctx)
         else:
             write_log(ctx, f"dry run: would create branch {branch_name}")
+        post_push_tasks: list[dict[str, Any]] = []
         for task in config.get("tasks", []):
             task_type = task["type"]
+            if task_type == "verify_pushed":
+                post_push_tasks.append(task)
+                write_log(ctx, f"task deferred until after push: {task['id']}")
+                continue
             write_log(ctx, f"task start: {task['id']} ({task_type})")
             if task_type == "codex":
                 task_codex(ctx, task)
@@ -293,14 +298,16 @@ def execute(config_path: Path, dry_run: bool) -> int:
                     write_log(ctx, f"dry run: skipped artifact assertion {task['id']}")
                 else:
                     task_verify_artifact(ctx, task)
-            elif task_type == "verify_pushed":
-                task_verify_pushed(ctx, task)
             else:
                 raise RuntimeError(f"unknown task type: {task_type}")
             write_log(ctx, f"task done: {task['id']}")
         if not dry_run:
             run_verify_command(ctx)
         commit_and_push(ctx)
+        for task in post_push_tasks:
+            write_log(ctx, f"task start: {task['id']} ({task['type']})")
+            task_verify_pushed(ctx, task)
+            write_log(ctx, f"task done: {task['id']}")
         write_summary(ctx, "passed")
         return 0
     except Exception as exc:
