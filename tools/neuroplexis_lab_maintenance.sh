@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="${REPO_ROOT:-/home/charles/Documents/Software/github/lab}"
+BASE_BRANCH="${BASE_BRANCH:-development}"
+COMPONENT_AREA="${COMPONENT_AREA:-public-safe orchestration, Kafka power scheduling, Paperclip integration, and repo hygiene}"
+MAX_CODEX_RUNS="${MAX_CODEX_RUNS:-5}"
+VERIFY_COMMAND="${VERIFY_COMMAND:-make check}"
+REPORT_DIR="${REPORT_DIR:-.paperclip/neuroplexis}"
+ALLOW_DIRTY_START="${ALLOW_DIRTY_START:-false}"
+PUSH_BRANCH="${PUSH_BRANCH:-false}"
+DRY_RUN="${DRY_RUN:-false}"
+AUTO_COMMIT="${AUTO_COMMIT:-false}"
+COMMIT_MESSAGE_PREFIX="${COMMIT_MESSAGE_PREFIX:-chore: neuroplexis maintenance}"
+REMOTE_NAME="${REMOTE_NAME:-origin}"
+ALLOWED_REMOTE_REPO="${ALLOWED_REMOTE_REPO:-CharlesDerek/lab}"
+SECRET_SCAN_PATTERN='(api[_-]?key|access[_-]?token|auth[_-]?token|bearer[_-]?token|secret|password|passwd|private[_-]?key)[[:space:]]*[:=][[:space:]]*["'\'']?[^"'\''[:space:]]{8,}|-----BEGIN (RSA |OPENSSH |EC |DSA |)?PRIVATE KEY-----'
+
+cd "$REPO_ROOT"
+
+timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+branch_component="$(printf '%s' "$COMPONENT_AREA" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-//;s/-$//' | cut -c1-48)"
+branch_name="routine/neuroplexis-${branch_component:-lab}-${timestamp}"
+run_dir="$REPORT_DIR/$timestamp"
+mkdir -p "$run_dir"
+
+log() {
+  printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" | tee -a "$run_dir/run.log"
+}
+
+capture() {
+  local name="$1"
+  shift
+  log "running: $*"
+  if "$@" >"$run_dir/$name.stdout.log" 2>"$run_dir/$name.stderr.log"; then
+    log "ok: $*"
+    return 0
+  fi
+  local status=$?
+  log "failed($status): $*"
+  return "$status"
+}
+
+remote_is_allowed() {
+  local remote_url
+  remote_url="$(git remote get-url --push "$REMOTE_NAME" 2>/dev/null || git remote get-url "$REMOTE_NAME" 2>/dev/null || true)"
+  [[ -n "$remote_url" ]] || return 1
+
+  case "$remote_url" in
+    git@github.com:"$ALLOWED_REMOTE_REPO".git) return 0 ;;
+    https://github.com/"$ALLOWED_REMOTE_REPO".git) return 0 ;;
+    https://github.com/"$ALLOWED_REMOTE_REPO") return 0 ;;
+    ssh://git@github.com/"$ALLOWED_REMOTE_REPO".git) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+scan_changed_files_for_secrets() {
+  local matches_file="$run_dir/secret-scan-matches.txt"
+  if python3 - "$matches_file" <<'PY'
+import pathlib
+import re
+import subprocess
+import sys
+
+matches_file = pathlib.Path(sys.argv[1])
+files = subprocess.check_output(
+    ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"],
+    text=True,
+).splitlines()
+assignment = re.compile(
+    r"(?P<key>api[_-]?key|access[_-]?token|auth[_-]?token|bearer[_-]?token|secret|password|passwd|private[_-]?key)"
+    r"\s*[:=]\s*[\"']?(?P<value>[^\"'\s#]{8,})",
+    re.I,
+)
+private_key = re.compile(r"-----BEGIN (RSA |OPENSSH |EC |DSA |)?PRIVATE KEY-----", re.I)
+placeholder_values = {
+    "replace-me",
+    "replace-me-locally",
+    "changeme",
+    "change-me",
+    "dummy",
+    "example",
+    "placeholder",
+}
+matches = []
+for file_name in files:
+    path = pathlib.Path(file_name)
+    if not path.is_file():
+        continue
+    try:
+        text = path.read_text(errors="ignore")
+    except OSError:
+        continue
+    if private_key.search(text):
+        matches.append(file_name)
+        continue
+    for match in assignment.finditer(text):
+        value = match.group("value").strip().strip("\"'")
+        if value.startswith("re.compile("):
+            continue
+        if value.lower() in placeholder_values:
+            continue
+        matches.append(file_name)
+        break
+
+matches_file.write_text("\n".join(matches) + ("\n" if matches else ""), encoding="utf-8")
+sys.exit(1 if matches else 0)
+PY
+  then
+    return 0
+  else
+    log "secret scan failed; possible secret-like assignment found in staged files"
+    log "see $matches_file for file names; refusing commit/push"
+    return 1
+  fi
+}
+
+dirty_status="$(git status --porcelain)"
+if [[ -n "$dirty_status" && "$ALLOW_DIRTY_START" != "true" ]]; then
+  log "refusing to start with dirty worktree; set ALLOW_DIRTY_START=true only when intentional"
+  git status --short | tee "$run_dir/initial-status.txt" >/dev/null
+  exit 2
+fi
+
+log "starting Neuroplexis lab maintenance"
+log "repo=$REPO_ROOT"
+log "base_branch=$BASE_BRANCH"
+log "branch=$branch_name"
+log "component_area=$COMPONENT_AREA"
+log "dry_run=$DRY_RUN"
+log "auto_commit=$AUTO_COMMIT"
+log "push_branch=$PUSH_BRANCH"
+log "allowed_remote_repo=$ALLOWED_REMOTE_REPO"
+
+if [[ "$DRY_RUN" == "true" ]]; then
+  log "dry run: checking command availability and writing simulated routine report"
+  command -v git >"$run_dir/git-command.txt"
+  command -v codex >"$run_dir/codex-command.txt" || log "dry run warning: codex command not found"
+  git branch --show-current >"$run_dir/current-branch.txt"
+  git status --short >"$run_dir/initial-status.txt"
+  if capture "dry-run-verify" bash -lc "$VERIFY_COMMAND"; then
+    verify_result="passed"
+  else
+    verify_result="failed"
+  fi
+  cat >"$run_dir/summary.md" <<EOF
+# Neuroplexis Routine Dry Run Summary
+
+- Timestamp: $timestamp
+- Planned branch: $branch_name
+- Current branch: $(cat "$run_dir/current-branch.txt")
+- Base branch: $BASE_BRANCH
+- Component area: $COMPONENT_AREA
+- Max Codex runs requested: $MAX_CODEX_RUNS
+- Verification command: \`$VERIFY_COMMAND\`
+- Verification result: $verify_result
+
+## What Was Simulated
+
+- Confirmed the runner can create report directories.
+- Confirmed Git is available.
+- Checked whether Codex is available.
+- Captured current branch and worktree status.
+- Ran the verification command.
+- Did not switch branches.
+- Did not invoke \`codex --yolo\`.
+- Did not commit or push.
+
+## Current Worktree Status
+
+\`\`\`text
+$(cat "$run_dir/initial-status.txt")
+\`\`\`
+EOF
+  log "dry run summary written to $run_dir/summary.md"
+  exit 0
+fi
+
+git fetch --all --prune >"$run_dir/git-fetch.stdout.log" 2>"$run_dir/git-fetch.stderr.log" || true
+git switch "$BASE_BRANCH"
+git pull --ff-only || true
+git switch -c "$branch_name"
+
+cat >"$run_dir/next-context.md" <<EOF
+# Neuroplexis Lab Maintenance Context
+
+Repo: $REPO_ROOT
+Base branch: $BASE_BRANCH
+Working branch: $branch_name
+Component area: $COMPONENT_AREA
+
+Goal: make small public-safe improvements to this lab repo. Preserve the public/private boundary. Do not add secrets, real topology, credentials, private IP inventories, BMC/IPMI details, vendor runbooks, or destructive automation.
+
+Loop contract:
+1. Pick one narrow task in the component area.
+2. Implement it.
+3. Run verification.
+4. Record what changed, what failed, and what the next run should know.
+5. Keep notes short enough to be useful to the next cycle.
+EOF
+
+for run_number in $(seq 1 "$MAX_CODEX_RUNS"); do
+  log "codex cycle $run_number/$MAX_CODEX_RUNS"
+  prompt_file="$run_dir/codex-$run_number.prompt.md"
+  cat >"$prompt_file" <<EOF
+You are Neuroplexis maintaining Project Athernex in $REPO_ROOT.
+
+Read $run_dir/next-context.md first.
+
+Work only on this component area:
+$COMPONENT_AREA
+
+Do one small public-safe improvement. After editing, run or prepare for:
+$VERIFY_COMMAND
+
+Constraints:
+- Create maintainable, scoped changes.
+- Do not add secrets, real topology, credentials, private network inventories, BMC/IPMI details, or destructive power procedures.
+- Respect the existing dirty worktree and never revert unrelated user changes.
+- Prefer tests/docs/contracts/local scaffolding over risky automation.
+- End by updating $run_dir/next-context.md with a compact handoff: changed files, verification result, open risks, and next recommended task.
+EOF
+
+  if ! capture "codex-$run_number" codex --yolo "$(cat "$prompt_file")"; then
+    log "stopping after codex failure in cycle $run_number"
+    break
+  fi
+
+  if ! capture "verify-$run_number" bash -lc "$VERIFY_COMMAND"; then
+    log "verification failed in cycle $run_number; continuing to collect report"
+  fi
+
+  git status --short >"$run_dir/status-after-$run_number.txt"
+  git diff --stat >"$run_dir/diffstat-after-$run_number.txt"
+  git diff --patch >"$run_dir/diff-after-$run_number.patch"
+done
+
+git status --short >"$run_dir/final-status.txt"
+git diff --stat >"$run_dir/final-diffstat.txt"
+git diff --patch >"$run_dir/final-diff.patch"
+
+cat >"$run_dir/summary.md" <<EOF
+# Neuroplexis Routine Summary
+
+- Timestamp: $timestamp
+- Branch: $branch_name
+- Base branch: $BASE_BRANCH
+- Component area: $COMPONENT_AREA
+- Max Codex runs requested: $MAX_CODEX_RUNS
+- Verification command: \`$VERIFY_COMMAND\`
+
+## Final Status
+
+\`\`\`text
+$(cat "$run_dir/final-status.txt")
+\`\`\`
+
+## Final Diffstat
+
+\`\`\`text
+$(cat "$run_dir/final-diffstat.txt")
+\`\`\`
+
+## Handoff
+
+$(cat "$run_dir/next-context.md")
+EOF
+
+log "summary written to $run_dir/summary.md"
+
+if [[ "$AUTO_COMMIT" == "true" ]]; then
+  if [[ -z "$(git status --porcelain)" ]]; then
+    log "no changes to commit"
+  else
+    git add --all
+    scan_changed_files_for_secrets
+    git commit -m "$COMMIT_MESSAGE_PREFIX: $timestamp"
+    log "committed routine changes"
+  fi
+else
+  log "auto commit disabled; set AUTO_COMMIT=true to commit routine changes"
+fi
+
+if [[ "$PUSH_BRANCH" == "true" ]]; then
+  if ! remote_is_allowed; then
+    log "remote guard failed; $REMOTE_NAME is not allowlisted as $ALLOWED_REMOTE_REPO"
+    exit 3
+  fi
+  git push -u "$REMOTE_NAME" "$branch_name"
+  log "pushed branch $branch_name"
+else
+  log "branch left local; set PUSH_BRANCH=true to push routine branches"
+fi

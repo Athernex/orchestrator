@@ -1,4 +1,4 @@
-.PHONY: local-up local-down local-logs run-orchestrator fmt check
+.PHONY: local-up local-down local-logs run-orchestrator run-paperclip run-codex-scheduler fmt check
 
 COMPOSE_FILE := infrastructure/local-dev/docker-compose.yml
 
@@ -13,6 +13,12 @@ local-logs:
 
 run-orchestrator:
 	cargo run -p orchestrator
+
+run-paperclip:
+	npx --registry https://registry.npmjs.org paperclipai run
+
+run-codex-scheduler:
+	python3 tools/codex_scheduler_bridge.py
 
 fmt:
 	cargo fmt --all
