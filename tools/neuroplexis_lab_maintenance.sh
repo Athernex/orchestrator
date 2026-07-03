@@ -218,6 +218,8 @@ Loop contract:
 5. Keep notes short enough to be useful to the next cycle.
 EOF
 
+codex_failed=false
+verify_failed=false
 for run_number in $(seq 1 "$MAX_CODEX_RUNS"); do
   log "codex cycle $run_number/$MAX_CODEX_RUNS"
   prompt_file="$run_dir/codex-$run_number.prompt.md"
@@ -242,11 +244,14 @@ EOF
 
   if ! capture "codex-$run_number" codex exec --dangerously-bypass-approvals-and-sandbox --cd "$REPO_ROOT" "$(cat "$prompt_file")"; then
     log "stopping after codex failure in cycle $run_number"
+    codex_failed=true
     break
   fi
 
   if ! capture "verify-$run_number" bash -lc "$VERIFY_COMMAND"; then
-    log "verification failed in cycle $run_number; continuing to collect report"
+    log "verification failed in cycle $run_number; refusing public commit/push after report collection"
+    verify_failed=true
+    break
   fi
 
   git status --short >"$run_dir/status-after-$run_number.txt"
@@ -286,6 +291,11 @@ $(cat "$run_dir/next-context.md")
 EOF
 
 log "summary written to $run_dir/summary.md"
+
+if [[ "$codex_failed" == "true" || "$verify_failed" == "true" ]]; then
+  log "routine produced local evidence but will not commit or push because codex_failed=$codex_failed verify_failed=$verify_failed"
+  exit 5
+fi
 
 if [[ "$AUTO_COMMIT" == "true" ]]; then
   if [[ -z "$(git status --porcelain)" ]]; then
