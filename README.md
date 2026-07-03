@@ -95,6 +95,18 @@ After authenticating the Paperclip CLI as a board/admin user, create the live Ne
 paperclip/routines/create-neuroplexis-lab-maintenance.sh
 ```
 
+Run the config-driven planning pipeline in simulation mode:
+
+```bash
+python3 tools/neuroplexis_pipeline_runner.py --dry-run
+```
+
+Run the same pipeline for one real planning task plus pushed-repo verification:
+
+```bash
+python3 tools/neuroplexis_pipeline_runner.py
+```
+
 Stop local services:
 
 ```bash
