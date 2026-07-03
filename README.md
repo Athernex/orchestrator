@@ -79,7 +79,7 @@ Run the local Codex scheduler bridge:
 make run-codex-scheduler
 ```
 
-The Codex scheduler bridge is not upstream Paperclip. It is a small local helper that can run `codex --yolo`, capture evidence under `.paperclip/`, verify with `make check`, and optionally commit/push when explicitly enabled. Keep it separate from Paperclip's own agent-management dashboard.
+The Codex scheduler bridge is not upstream Paperclip. It is a small local helper that can run Codex in non-interactive bypass mode, capture evidence under `.paperclip/`, verify with `make check`, and optionally commit/push when explicitly enabled. Keep it separate from Paperclip's own agent-management dashboard.
 
 Run the Neuroplexis maintenance routine runner directly:
 
@@ -123,7 +123,7 @@ make local-down
 6. **Rust orchestration:** typed workflow states, retry policies, idempotency keys, and conservative rate limits before any rack-wide scheduling.
 7. **Paperclip adapter:** public-safe request/response envelopes, with secrets and private prompt material kept out of git.
 8. **Failure, security, and hallucination controls:** deterministic validation, evidence capture, review queues, quarantine states, and staged promotion.
-9. **Scheduled public improvements:** official Paperclip can manage agents and routines; the local Codex scheduler bridge can run `codex --yolo`, verify with `make check`, and optionally commit/push public-safe changes.
+9. **Scheduled public improvements:** official Paperclip can manage agents and routines; the local Codex scheduler bridge can run Codex in non-interactive bypass mode, verify with `make check`, and optionally commit/push public-safe changes.
 10. **Neuroplexis repo maintenance:** a bounded routine runner creates task branches, runs up to 5 Codex cycles, verifies after each cycle, and records compact handoff notes.
 
 ## Safety Boundary

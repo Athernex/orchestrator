@@ -151,7 +151,17 @@ def task_codex(ctx: PipelineContext, task: dict[str, Any]) -> None:
         return
     max_runs = int(task.get("maxRuns", 1))
     for index in range(max_runs):
-        result = run(["codex", "--yolo", prompt], ctx.repo_root)
+        result = run(
+            [
+                "codex",
+                "exec",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--cd",
+                str(ctx.repo_root),
+                prompt,
+            ],
+            ctx.repo_root,
+        )
         (ctx.run_dir / f"{task['id']}-{index + 1}.stdout.log").write_text(
             result.stdout,
             encoding="utf-8",
@@ -312,4 +322,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

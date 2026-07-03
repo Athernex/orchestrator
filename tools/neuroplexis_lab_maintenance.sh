@@ -222,7 +222,7 @@ Constraints:
 - End by updating $run_dir/next-context.md with a compact handoff: changed files, verification result, open risks, and next recommended task.
 EOF
 
-  if ! capture "codex-$run_number" codex --yolo "$(cat "$prompt_file")"; then
+  if ! capture "codex-$run_number" codex exec --dangerously-bypass-approvals-and-sandbox --cd "$REPO_ROOT" "$(cat "$prompt_file")"; then
     log "stopping after codex failure in cycle $run_number"
     break
   fi

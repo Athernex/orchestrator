@@ -14,7 +14,7 @@
       "id": "plan-future-work",
       "type": "codex",
       "maxRuns": 1,
-      "prompt": "Create a public-safe future work planning artifact for Project Athernex. Add or update docs/planning/neuroplexis-future-tasks.md with a concise backlog of future tasks for Kafka broker power scheduling, Rust orchestration, Paperclip routine integration, Kubernetes scheduling contracts, tests, and public/private boundary hygiene. Do not add secrets, private topology, credentials, private network inventories, BMC/IPMI details, or destructive power procedures."
+      "prompt": "Create a public-safe future work planning artifact for Project Athernex. Add or update docs/planning/neuroplexis-future-tasks.md with a concise backlog of future tasks for Kafka broker power scheduling, Rust orchestration, Paperclip routine integration, Kubernetes scheduling contracts, tests, and public/private boundary hygiene. Do not add secrets, private topology, credentials, private network inventories, BMC/IPMI details, or destructive power procedures. Make only this planning artifact change."
     },
     {
       "id": "verify-planning-artifact",
