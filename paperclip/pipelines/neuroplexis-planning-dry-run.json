@@ -3,8 +3,11 @@
   "repoRoot": "/home/charles/Documents/Software/github/lab",
   "baseBranch": "development",
   "branchPrefix": "routine/neuroplexis-planning-dry-run",
-  "remoteName": "athernex",
-  "allowedRemoteRepo": "Athernex/orchestrator",
+  "primaryRemoteName": "origin",
+  "primaryAllowedRemoteRepo": "CharlesDerek/lab",
+  "downstreamRemoteName": "athernex",
+  "downstreamAllowedRemoteRepo": "Athernex/orchestrator",
+  "downstreamBranch": "retrospective",
   "verifyCommand": "make check",
   "autoCommit": true,
   "pushBranch": true,
@@ -33,6 +36,17 @@
     {
       "id": "verify-pushed-repo",
       "type": "verify_pushed",
+      "remoteName": "origin",
+      "branchMustExistOnRemote": true,
+      "requiredFiles": [
+        "docs/planning/neuroplexis-future-tasks.md"
+      ]
+    },
+    {
+      "id": "verify-downstream-retrospective",
+      "type": "verify_pushed",
+      "remoteName": "athernex",
+      "branchName": "retrospective",
       "branchMustExistOnRemote": true,
       "requiredFiles": [
         "docs/planning/neuroplexis-future-tasks.md"

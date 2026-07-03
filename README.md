@@ -78,7 +78,14 @@ Git remotes are split by role:
 - `origin`: personal R&D source, `git@github.com:CharlesDerek/lab.git`
 - `athernex`: public downstream orchestrator repo, `git@github.com:Athernex/orchestrator.git`
 
-Scheduled routine pushes are guarded by an allowlist and target the `athernex` remote.
+Scheduled routine pushes are guarded by allowlists for both remotes.
+The push order is deliberate: push the source branch to `origin` first, then push the same `HEAD` to `athernex/retrospective`.
+
+Manual dual push:
+
+```bash
+tools/push_downstream.sh
+```
 
 Run the local Codex scheduler bridge:
 

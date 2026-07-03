@@ -14,6 +14,11 @@ AUTO_COMMIT="${AUTO_COMMIT:-false}"
 COMMIT_MESSAGE_PREFIX="${COMMIT_MESSAGE_PREFIX:-chore: neuroplexis maintenance}"
 REMOTE_NAME="${REMOTE_NAME:-origin}"
 ALLOWED_REMOTE_REPO="${ALLOWED_REMOTE_REPO:-CharlesDerek/lab}"
+PRIMARY_REMOTE="${PRIMARY_REMOTE:-origin}"
+PRIMARY_ALLOWED_REPO="${PRIMARY_ALLOWED_REPO:-CharlesDerek/lab}"
+DOWNSTREAM_REMOTE="${DOWNSTREAM_REMOTE:-athernex}"
+DOWNSTREAM_ALLOWED_REPO="${DOWNSTREAM_ALLOWED_REPO:-Athernex/orchestrator}"
+DOWNSTREAM_BRANCH="${DOWNSTREAM_BRANCH:-retrospective}"
 SECRET_SCAN_PATTERN='(api[_-]?key|access[_-]?token|auth[_-]?token|bearer[_-]?token|secret|password|passwd|private[_-]?key)[[:space:]]*[:=][[:space:]]*["'\'']?[^"'\''[:space:]]{8,}|-----BEGIN (RSA |OPENSSH |EC |DSA |)?PRIVATE KEY-----'
 
 cd "$REPO_ROOT"
@@ -42,15 +47,17 @@ capture() {
 }
 
 remote_is_allowed() {
+  local remote_name="${1:-$REMOTE_NAME}"
+  local allowed_repo="${2:-$ALLOWED_REMOTE_REPO}"
   local remote_url
-  remote_url="$(git remote get-url --push "$REMOTE_NAME" 2>/dev/null || git remote get-url "$REMOTE_NAME" 2>/dev/null || true)"
+  remote_url="$(git remote get-url --push "$remote_name" 2>/dev/null || git remote get-url "$remote_name" 2>/dev/null || true)"
   [[ -n "$remote_url" ]] || return 1
 
   case "$remote_url" in
-    git@github.com:"$ALLOWED_REMOTE_REPO".git) return 0 ;;
-    https://github.com/"$ALLOWED_REMOTE_REPO".git) return 0 ;;
-    https://github.com/"$ALLOWED_REMOTE_REPO") return 0 ;;
-    ssh://git@github.com/"$ALLOWED_REMOTE_REPO".git) return 0 ;;
+    git@github.com:"$allowed_repo".git) return 0 ;;
+    https://github.com/"$allowed_repo".git) return 0 ;;
+    https://github.com/"$allowed_repo") return 0 ;;
+    ssh://git@github.com/"$allowed_repo".git) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -132,6 +139,11 @@ log "dry_run=$DRY_RUN"
 log "auto_commit=$AUTO_COMMIT"
 log "push_branch=$PUSH_BRANCH"
 log "allowed_remote_repo=$ALLOWED_REMOTE_REPO"
+log "primary_remote=$PRIMARY_REMOTE"
+log "primary_allowed_repo=$PRIMARY_ALLOWED_REPO"
+log "downstream_remote=$DOWNSTREAM_REMOTE"
+log "downstream_allowed_repo=$DOWNSTREAM_ALLOWED_REPO"
+log "downstream_branch=$DOWNSTREAM_BRANCH"
 
 if [[ "$DRY_RUN" == "true" ]]; then
   log "dry run: checking command availability and writing simulated routine report"
@@ -283,12 +295,18 @@ else
 fi
 
 if [[ "$PUSH_BRANCH" == "true" ]]; then
-  if ! remote_is_allowed; then
-    log "remote guard failed; $REMOTE_NAME is not allowlisted as $ALLOWED_REMOTE_REPO"
+  if ! remote_is_allowed "$PRIMARY_REMOTE" "$PRIMARY_ALLOWED_REPO"; then
+    log "primary remote guard failed; $PRIMARY_REMOTE is not allowlisted as $PRIMARY_ALLOWED_REPO"
     exit 3
   fi
-  git push -u "$REMOTE_NAME" "$branch_name"
-  log "pushed branch $branch_name"
+  if ! remote_is_allowed "$DOWNSTREAM_REMOTE" "$DOWNSTREAM_ALLOWED_REPO"; then
+    log "downstream remote guard failed; $DOWNSTREAM_REMOTE is not allowlisted as $DOWNSTREAM_ALLOWED_REPO"
+    exit 4
+  fi
+  git push -u "$PRIMARY_REMOTE" "$branch_name:$branch_name"
+  log "pushed branch $branch_name to $PRIMARY_REMOTE"
+  git push "$DOWNSTREAM_REMOTE" "HEAD:$DOWNSTREAM_BRANCH"
+  log "pushed same HEAD to $DOWNSTREAM_REMOTE/$DOWNSTREAM_BRANCH"
 else
   log "branch left local; set PUSH_BRANCH=true to push routine branches"
 fi

@@ -90,9 +90,7 @@ def ensure_clean_start(ctx: PipelineContext) -> None:
         raise RuntimeError("worktree is dirty and allowDirtyStart is false")
 
 
-def remote_is_allowed(ctx: PipelineContext) -> bool:
-    remote_name = ctx.config.get("remoteName", "origin")
-    allowed = ctx.config["allowedRemoteRepo"]
+def remote_is_allowed(ctx: PipelineContext, remote_name: str, allowed: str) -> bool:
     remote = run(["git", "remote", "get-url", "--push", remote_name], ctx.repo_root, check=True)
     remote_url = remote.stdout.strip()
     allowed_urls = {
@@ -101,7 +99,10 @@ def remote_is_allowed(ctx: PipelineContext) -> bool:
         f"https://github.com/{allowed}",
         f"ssh://git@github.com/{allowed}.git",
     }
-    (ctx.run_dir / "remote-url.txt").write_text(remote_url + "\n", encoding="utf-8")
+    (ctx.run_dir / f"{remote_name}-remote-url.txt").write_text(
+        remote_url + "\n",
+        encoding="utf-8",
+    )
     return remote_url in allowed_urls
 
 
@@ -196,23 +197,27 @@ def task_verify_artifact(ctx: PipelineContext, task: dict[str, Any]) -> None:
 
 
 def task_verify_pushed(ctx: PipelineContext, task: dict[str, Any]) -> None:
-    remote_name = ctx.config.get("remoteName", "origin")
+    remote_name = task.get("remoteName", ctx.config.get("primaryRemoteName", "origin"))
+    branch_name = task.get("branchName", ctx.branch_name)
     if task.get("branchMustExistOnRemote", False):
-        result = run(["git", "ls-remote", "--heads", remote_name, ctx.branch_name], ctx.repo_root)
-        (ctx.run_dir / "ls-remote.txt").write_text(result.stdout, encoding="utf-8")
+        result = run(["git", "ls-remote", "--heads", remote_name, branch_name], ctx.repo_root)
+        (ctx.run_dir / f"ls-remote-{remote_name}-{branch_name.replace('/', '-')}.txt").write_text(
+            result.stdout,
+            encoding="utf-8",
+        )
         if ctx.dry_run:
             write_log(ctx, "dry run: skipped remote branch existence assertion")
         elif not result.stdout.strip():
-            raise RuntimeError("remote branch was not found after push")
+            raise RuntimeError(f"remote branch was not found after push: {remote_name}/{branch_name}")
 
     if not ctx.dry_run:
         for file_name in task.get("requiredFiles", []):
             result = run(
-                ["git", "show", f"{remote_name}/{ctx.branch_name}:{file_name}"],
+                ["git", "show", f"{remote_name}/{branch_name}:{file_name}"],
                 ctx.repo_root,
             )
             if result.returncode != 0:
-                raise RuntimeError(f"file not present on pushed branch: {file_name}")
+                raise RuntimeError(f"file not present on pushed branch {remote_name}/{branch_name}: {file_name}")
     write_log(ctx, f"verified pushed repo task {task['id']}")
 
 
@@ -244,10 +249,22 @@ def commit_and_push(ctx: PipelineContext) -> None:
         check=True,
     )
     if ctx.config.get("pushBranch", False):
-        if not remote_is_allowed(ctx):
-            raise RuntimeError("remote is not allowlisted")
+        primary_remote = ctx.config.get("primaryRemoteName", "origin")
+        primary_allowed = ctx.config.get("primaryAllowedRemoteRepo", "CharlesDerek/lab")
+        downstream_remote = ctx.config.get("downstreamRemoteName", "athernex")
+        downstream_allowed = ctx.config.get("downstreamAllowedRemoteRepo", "Athernex/orchestrator")
+        downstream_branch = ctx.config.get("downstreamBranch", "retrospective")
+        if not remote_is_allowed(ctx, primary_remote, primary_allowed):
+            raise RuntimeError("primary remote is not allowlisted")
+        if not remote_is_allowed(ctx, downstream_remote, downstream_allowed):
+            raise RuntimeError("downstream remote is not allowlisted")
         run(
-            ["git", "push", "-u", ctx.config.get("remoteName", "origin"), ctx.branch_name],
+            ["git", "push", "-u", primary_remote, f"{ctx.branch_name}:{ctx.branch_name}"],
+            ctx.repo_root,
+            check=True,
+        )
+        run(
+            ["git", "push", downstream_remote, f"HEAD:{downstream_branch}"],
             ctx.repo_root,
             check=True,
         )
