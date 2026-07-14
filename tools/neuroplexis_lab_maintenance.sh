@@ -10,6 +10,7 @@ REPORT_DIR="${REPORT_DIR:-.paperclip/neuroplexis}"
 ALLOW_DIRTY_START="${ALLOW_DIRTY_START:-false}"
 PUSH_BRANCH="${PUSH_BRANCH:-false}"
 DRY_RUN="${DRY_RUN:-false}"
+REQUIRE_CODEX_CHANGE="${REQUIRE_CODEX_CHANGE:-true}"
 AUTO_COMMIT="${AUTO_COMMIT:-false}"
 COMMIT_MESSAGE_PREFIX="${COMMIT_MESSAGE_PREFIX:-chore: neuroplexis maintenance}"
 REMOTE_NAME="${REMOTE_NAME:-origin}"
@@ -44,6 +45,26 @@ capture() {
   local status=$?
   log "failed($status): $*"
   return "$status"
+}
+
+workspace_fingerprint() {
+  {
+    printf '## status\n'
+    git status --porcelain=v1 --untracked-files=all
+    printf '\n## unstaged diff\n'
+    git diff --binary
+    printf '\n## staged diff\n'
+    git diff --cached --binary
+    printf '\n## untracked files\n'
+    git ls-files --others --exclude-standard -z |
+      while IFS= read -r -d '' file_name; do
+        if [[ -f "$file_name" ]]; then
+          sha256sum "$file_name"
+        else
+          printf 'untracked-nonfile  %s\n' "$file_name"
+        fi
+      done
+  }
 }
 
 remote_is_allowed() {
@@ -136,6 +157,7 @@ log "base_branch=$BASE_BRANCH"
 log "branch=$branch_name"
 log "component_area=$COMPONENT_AREA"
 log "dry_run=$DRY_RUN"
+log "require_codex_change=$REQUIRE_CODEX_CHANGE"
 log "auto_commit=$AUTO_COMMIT"
 log "push_branch=$PUSH_BRANCH"
 log "allowed_remote_repo=$ALLOWED_REMOTE_REPO"
@@ -189,6 +211,16 @@ EOF
   exit 0
 fi
 
+if ! [[ "$MAX_CODEX_RUNS" =~ ^[1-9][0-9]*$ ]]; then
+  log "MAX_CODEX_RUNS must be a positive integer"
+  exit 2
+fi
+
+if ! command -v codex >/dev/null 2>&1; then
+  log "codex command not found; refusing real maintenance run"
+  exit 2
+fi
+
 git fetch --all --prune >"$run_dir/git-fetch.stdout.log" 2>"$run_dir/git-fetch.stderr.log" || true
 git switch "$BASE_BRANCH"
 git pull --ff-only || true
@@ -216,13 +248,18 @@ Loop contract:
 3. Run verification.
 4. Record what changed, what failed, and what the next run should know.
 5. Keep notes short enough to be useful to the next cycle.
+6. The next cycle must pick a different incremental task unless the prior one failed.
 EOF
 
 codex_failed=false
 verify_failed=false
+no_change_failed=false
 for run_number in $(seq 1 "$MAX_CODEX_RUNS"); do
   log "codex cycle $run_number/$MAX_CODEX_RUNS"
   prompt_file="$run_dir/codex-$run_number.prompt.md"
+  before_fingerprint="$run_dir/fingerprint-before-$run_number.txt"
+  after_fingerprint="$run_dir/fingerprint-after-$run_number.txt"
+  workspace_fingerprint >"$before_fingerprint"
   cat >"$prompt_file" <<EOF
 You are Neuroplexis maintaining Project Athernex in $REPO_ROOT.
 
@@ -233,6 +270,8 @@ $COMPONENT_AREA
 
 Do one small public-safe improvement. After editing, run or prepare for:
 $VERIFY_COMMAND
+
+This is cycle $run_number of $MAX_CODEX_RUNS. Leave a concrete repository change in this cycle; do not only inspect files, write a summary, or say that work is already complete. Use the handoff notes to choose a different incremental change from prior cycles.
 
 Constraints:
 - Create maintainable, scoped changes.
@@ -246,6 +285,18 @@ EOF
     log "stopping after codex failure in cycle $run_number"
     codex_failed=true
     break
+  fi
+
+  workspace_fingerprint >"$after_fingerprint"
+  if cmp -s "$before_fingerprint" "$after_fingerprint"; then
+    log "codex cycle $run_number produced no repository changes"
+    if [[ "$REQUIRE_CODEX_CHANGE" == "true" ]]; then
+      log "stopping because REQUIRE_CODEX_CHANGE=true"
+      no_change_failed=true
+      break
+    fi
+  else
+    log "codex cycle $run_number produced repository changes"
   fi
 
   if ! capture "verify-$run_number" bash -lc "$VERIFY_COMMAND"; then
@@ -292,8 +343,8 @@ EOF
 
 log "summary written to $run_dir/summary.md"
 
-if [[ "$codex_failed" == "true" || "$verify_failed" == "true" ]]; then
-  log "routine produced local evidence but will not commit or push because codex_failed=$codex_failed verify_failed=$verify_failed"
+if [[ "$codex_failed" == "true" || "$verify_failed" == "true" || "$no_change_failed" == "true" ]]; then
+  log "routine produced local evidence but will not commit or push because codex_failed=$codex_failed verify_failed=$verify_failed no_change_failed=$no_change_failed"
   exit 5
 fi
 

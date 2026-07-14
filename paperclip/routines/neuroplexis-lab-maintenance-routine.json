@@ -12,6 +12,8 @@
     "VERIFY_COMMAND": "make check",
     "COMPONENT_AREA": "public-safe orchestration, Kafka power scheduling, Paperclip integration, and repo hygiene",
     "ALLOW_DIRTY_START": "true",
+    "DRY_RUN": "false",
+    "REQUIRE_CODEX_CHANGE": "true",
     "AUTO_COMMIT": "true",
     "PUSH_BRANCH": "true",
     "REMOTE_NAME": "origin",

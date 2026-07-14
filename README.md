@@ -65,6 +65,14 @@ Run the Rust orchestrator preparation stub:
 make run-orchestrator
 ```
 
+Run the full local validation suite:
+
+```bash
+make check
+```
+
+This validates the Rust workspace and the public automation layer: shell syntax, Python bytecode compilation, Paperclip JSON payload parsing, and the Neuroplexis maintenance runner dry-run path.
+
 Run the official Paperclip AI server:
 
 ```bash
@@ -100,6 +108,8 @@ Run the Neuroplexis maintenance routine runner directly:
 ```bash
 tools/neuroplexis_lab_maintenance.sh
 ```
+
+By default this is a real bounded maintenance run: it creates a task branch, invokes Codex for each cycle, requires every Codex cycle to leave a repository change, verifies with `make check`, and only then proceeds to commit/push when those flags are enabled. Set `DRY_RUN=true` only when you intentionally want a simulation that does not invoke Codex or change branches.
 
 Paperclip routine payload templates live in `paperclip/routines/`. The intended schedule is every 6 hours with `skip_if_active` concurrency so overlapping maintenance cycles do not stack.
 
@@ -160,6 +170,7 @@ Use sanitized component names and capability classes instead. See [architecture/
 - [x] Kafka broker and power-scheduler control-loop model
 - [x] Official Paperclip run target
 - [x] Local Codex scheduler bridge for gated `codex --yolo` improvement runs
+- [x] Automation validation wired into `make check`
 - [ ] Real Kafka consumer and producer implementation
 - [ ] Kubernetes scheduler adapter contracts
 - [ ] Paperclip adapter implementation
