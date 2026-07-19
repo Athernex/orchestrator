@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - retrospective
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  automation:
+    name: Automation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate automation
+        run: make check-automation check-workflows
+
+  opentofu:
+    name: OpenTofu Kubernetes Contract
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infrastructure/opentofu/kubernetes-scheduler-contract
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install OpenTofu
+        uses: opentofu/setup-opentofu@v1
+
+      - name: Check formatting
+        run: tofu fmt -check -recursive
+
+      - name: Init
+        run: tofu init -backend=false
+
+      - name: Validate
+        run: tofu validate
+
+      - name: Test
+        run: tofu test
+
+      - name: Contract smoke plan
+        run: tofu plan -input=false

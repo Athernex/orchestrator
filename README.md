@@ -71,7 +71,15 @@ Run the full local validation suite:
 make check
 ```
 
-This validates the Rust workspace and the public automation layer: shell syntax, Python bytecode compilation, Paperclip JSON payload parsing, and the Neuroplexis maintenance runner dry-run path.
+This validates the Rust workspace, Rust unit tests, GitHub workflow coverage, and the public automation layer: shell syntax, Python bytecode compilation, Paperclip JSON payload parsing, and the Neuroplexis maintenance runner dry-run path. If OpenTofu is installed as `tofu`, it also runs `fmt`, `init -backend=false`, `validate`, and `test` against the Kubernetes scheduler contract in `infrastructure/opentofu/kubernetes-scheduler-contract/`.
+
+Run the OpenTofu/Kubernetes contract checks directly:
+
+```bash
+make check-opentofu
+```
+
+The OpenTofu module renders sanitized Kubernetes Namespace, ServiceAccount, and ConfigMap contract data without requiring a live cluster or private rack details.
 
 Run the official Paperclip AI server:
 
@@ -165,6 +173,9 @@ Use sanitized component names and capability classes instead. See [architecture/
 - [x] Public-safe architecture direction
 - [x] Local Kafka-compatible and LocalStack staging compose file
 - [x] Rust orchestrator placeholder with explicit configuration surface
+- [x] Rust unit tests for scheduler and workflow contracts
+- [x] GitHub Actions CI for Rust, automation, and OpenTofu checks
+- [x] OpenTofu Kubernetes scheduler contract tests
 - [x] Failure and hallucination review model
 - [x] Public-safe Athernex datacenter capability model
 - [x] Kafka broker and power-scheduler control-loop model

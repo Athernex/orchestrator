@@ -1,6 +1,7 @@
-.PHONY: local-up local-down local-logs run-orchestrator run-paperclip run-codex-scheduler fmt check check-rust check-automation
+.PHONY: local-up local-down local-logs run-orchestrator run-paperclip run-codex-scheduler fmt check check-rust check-automation check-opentofu check-workflows
 
 COMPOSE_FILE := infrastructure/local-dev/docker-compose.yml
+TOFU ?= tofu
 
 local-up:
 	docker compose -f $(COMPOSE_FILE) up -d
@@ -23,13 +24,27 @@ run-codex-scheduler:
 fmt:
 	cargo fmt --all
 
-check: check-rust check-automation
+check: check-rust check-automation check-workflows check-opentofu
 
 check-rust:
 	cargo check --workspace
+	cargo test --workspace
 
 check-automation:
 	bash -n tools/*.sh paperclip/routines/*.sh
 	python3 -m py_compile tools/*.py
 	find paperclip -name '*.json' -print0 | xargs -0 -n1 python3 -m json.tool >/dev/null
-	ALLOW_DIRTY_START=true DRY_RUN=true MAX_CODEX_RUNS=1 VERIFY_COMMAND=true tools/neuroplexis_lab_maintenance.sh
+	REPO_ROOT=$(CURDIR) ALLOW_DIRTY_START=true DRY_RUN=true MAX_CODEX_RUNS=1 VERIFY_COMMAND=true tools/neuroplexis_lab_maintenance.sh
+
+check-workflows:
+	python3 tools/validate_ci_workflow.py
+
+check-opentofu:
+	@if command -v $(TOFU) >/dev/null 2>&1; then \
+		$(TOFU) -chdir=infrastructure/opentofu/kubernetes-scheduler-contract fmt -check -recursive; \
+		$(TOFU) -chdir=infrastructure/opentofu/kubernetes-scheduler-contract init -backend=false; \
+		$(TOFU) -chdir=infrastructure/opentofu/kubernetes-scheduler-contract validate; \
+		$(TOFU) -chdir=infrastructure/opentofu/kubernetes-scheduler-contract test; \
+	else \
+		echo "OpenTofu not found; skipping check-opentofu"; \
+	fi

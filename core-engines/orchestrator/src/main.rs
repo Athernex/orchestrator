@@ -36,7 +36,7 @@ impl OrchestratorConfig {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum WorkflowState {
     Received,
     Validated,
@@ -72,7 +72,7 @@ struct CapacitySnapshot {
     idle_seconds: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum SchedulingDecision {
     RunHere {
         run_id: &'static str,
@@ -155,7 +155,7 @@ fn sample_scheduling_decisions(config: &OrchestratorConfig) -> [SchedulingDecisi
                 remote_powering_slots: 0,
                 idle_seconds: 0,
             },
-            &config,
+            config,
         ),
         decide_capacity_action(
             &JobRequest {
@@ -170,7 +170,7 @@ fn sample_scheduling_decisions(config: &OrchestratorConfig) -> [SchedulingDecisi
                 remote_powering_slots: 0,
                 idle_seconds: 0,
             },
-            &config,
+            config,
         ),
         decide_capacity_action(
             &JobRequest {
@@ -185,7 +185,7 @@ fn sample_scheduling_decisions(config: &OrchestratorConfig) -> [SchedulingDecisi
                 remote_powering_slots: 0,
                 idle_seconds: 0,
             },
-            &config,
+            config,
         ),
     ]
 }
@@ -330,4 +330,143 @@ fn read_u32_env(key: &str, default: u32) -> u32 {
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> OrchestratorConfig {
+        OrchestratorConfig {
+            project_name: "Project Athernex".to_string(),
+            control_plane_role: "local-control-plane".to_string(),
+            scheduler_mode: "contract-only".to_string(),
+            local_capacity_slots: 2,
+            remote_wake_threshold_slots: 3,
+            idle_powerdown_after_seconds: 900,
+            kafka_bootstrap_servers: "127.0.0.1:9092".to_string(),
+            localstack_endpoint: "http://127.0.0.1:4566".to_string(),
+            paperclip_endpoint: "http://127.0.0.1:3100".to_string(),
+            max_in_flight: 8,
+            retry_limit: 3,
+        }
+    }
+
+    #[test]
+    fn interactive_jobs_prefer_available_local_capacity() {
+        let decision = decide_capacity_action(
+            &JobRequest {
+                run_id: "interactive-local-001",
+                required_slots: 1,
+                priority: JobPriority::Interactive,
+                allows_remote_capacity: false,
+            },
+            &CapacitySnapshot {
+                local_available_slots: 2,
+                remote_online_slots: 4,
+                remote_powering_slots: 0,
+                idle_seconds: 0,
+            },
+            &config(),
+        );
+
+        assert_eq!(
+            decision,
+            SchedulingDecision::RunHere {
+                run_id: "interactive-local-001",
+                slots: 1
+            }
+        );
+    }
+
+    #[test]
+    fn oversized_remote_allowed_jobs_request_power_on_at_threshold() {
+        let decision = decide_capacity_action(
+            &JobRequest {
+                run_id: "batch-remote-001",
+                required_slots: 4,
+                priority: JobPriority::Batch,
+                allows_remote_capacity: true,
+            },
+            &CapacitySnapshot {
+                local_available_slots: 2,
+                remote_online_slots: 0,
+                remote_powering_slots: 0,
+                idle_seconds: 0,
+            },
+            &config(),
+        );
+
+        assert_eq!(
+            decision,
+            SchedulingDecision::RequestPowerOn {
+                run_id: "batch-remote-001",
+                target_group: "worker-group-a",
+                slots: 4
+            }
+        );
+    }
+
+    #[test]
+    fn maintenance_jobs_hold_for_promotion_window() {
+        let decision = decide_capacity_action(
+            &JobRequest {
+                run_id: "maintenance-001",
+                required_slots: 1,
+                priority: JobPriority::Maintenance,
+                allows_remote_capacity: false,
+            },
+            &CapacitySnapshot {
+                local_available_slots: 2,
+                remote_online_slots: 0,
+                remote_powering_slots: 0,
+                idle_seconds: 0,
+            },
+            &config(),
+        );
+
+        assert_eq!(
+            decision,
+            SchedulingDecision::Hold {
+                run_id: "maintenance-001",
+                reason: "maintenance jobs require an explicit promotion window"
+            }
+        );
+    }
+
+    #[test]
+    fn idle_remote_workers_request_power_off_after_threshold() {
+        let decision = decide_idle_action(
+            &CapacitySnapshot {
+                local_available_slots: 2,
+                remote_online_slots: 4,
+                remote_powering_slots: 0,
+                idle_seconds: 901,
+            },
+            &config(),
+        );
+
+        assert_eq!(
+            decision,
+            Some(SchedulingDecision::RequestPowerOff {
+                target_group: "worker-group-a",
+                idle_seconds: 901
+            })
+        );
+    }
+
+    #[test]
+    fn workflow_state_count_matches_public_contract() {
+        assert_eq!(workflow_states().len(), 9);
+        assert!(workflow_states().contains(&WorkflowState::Deadlettered));
+    }
+
+    #[test]
+    fn kafka_topics_include_review_and_audit_paths() {
+        let topics = kafka_topics();
+
+        assert!(topics.contains(&"agent.review"));
+        assert!(topics.contains(&"agent.audit"));
+        assert!(topics.contains(&"agent.deadletter"));
+    }
 }
