@@ -8,8 +8,12 @@ CI_WORKFLOW = Path(".github/workflows/ci.yml")
 RELEASE_WORKFLOW = Path(".github/workflows/release-promotion.yml")
 
 REQUIRED_CI_SNIPPETS = (
+    "Swatinem/rust-cache@v2",
     "cargo fmt --all -- --check",
     "cargo clippy --workspace --all-targets -- -D warnings",
+    "cargo install cargo-audit cargo-cyclonedx --locked",
+    "cargo audit",
+    "cargo cyclonedx --format json --override-filename rust-sbom",
     "make check-automation check-workflows",
     "opentofu/setup-opentofu",
     "run: tofu test",
@@ -19,7 +23,12 @@ REQUIRED_RELEASE_SNIPPETS = (
     'tags:',
     '"v*"',
     "workflow_dispatch:",
+    "Swatinem/rust-cache@v2",
+    "cargo install cargo-audit cargo-cyclonedx --locked",
     "make check",
+    "cargo audit > dist/evidence/cargo-audit.txt",
+    "cargo metadata --locked --format-version 1",
+    "rust-sbom.cdx.json",
     "cargo build --workspace --release",
     "tofu -chdir=",
     "actions/upload-artifact@v4",

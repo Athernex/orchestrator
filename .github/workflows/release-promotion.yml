@@ -35,11 +35,27 @@ jobs:
         with:
           components: clippy,rustfmt
 
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
       - name: Install OpenTofu
         uses: opentofu/setup-opentofu@v1
 
+      - name: Install supply-chain tooling
+        run: cargo install cargo-audit cargo-cyclonedx --locked
+
       - name: Run full validation gate
         run: make check
+
+      - name: Capture supply-chain evidence
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist/evidence
+          cargo audit > dist/evidence/cargo-audit.txt
+          cargo metadata --locked --format-version 1 > dist/evidence/cargo-metadata.json
+          cargo cyclonedx --format json --override-filename rust-sbom
+          mv core-engines/orchestrator/rust-sbom.json dist/evidence/rust-sbom.cdx.json
 
       - name: Build orchestrator release binary
         run: cargo build --workspace --release
@@ -88,6 +104,8 @@ jobs:
             echo "- Validation gate: \`make check\`"
             echo "- Build command: \`cargo build --workspace --release\`"
             echo "- OpenTofu plan: \`evidence/opentofu-plan.txt\`"
+            echo "- Dependency audit: \`evidence/cargo-audit.txt\`"
+            echo "- Rust SBOM: \`evidence/rust-sbom.cdx.json\`"
             echo
             echo "## Public Boundary"
             echo
@@ -108,6 +126,8 @@ jobs:
           sha256sum \
             dist/orchestrator-linux-x86_64 \
             "dist/athernex-release-evidence-${VERSION}.tar.gz" \
+            dist/evidence/cargo-metadata.json \
+            dist/evidence/rust-sbom.cdx.json \
             > dist/SHA256SUMS
 
       - name: Upload promotion artifacts

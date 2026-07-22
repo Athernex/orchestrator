@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added supply-chain CI coverage with Rust dependency caching, `cargo audit`, CycloneDX SBOM generation, and release evidence checksums for dependency metadata and SBOM artifacts.
 - Added a release promotion GitHub Actions workflow that validates the repo, builds the Rust orchestrator, renders a sanitized OpenTofu plan, packages promotion evidence, publishes checksums, uploads artifacts, and can publish GitHub Releases from version tags.
 - Added an automation validation target for shell syntax, Python bytecode compilation, Paperclip JSON parsing, and the Neuroplexis runner dry-run path.
 - Wired `make check` to validate both the Rust workspace and local automation surfaces.

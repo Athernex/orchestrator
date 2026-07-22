@@ -23,6 +23,9 @@ jobs:
         with:
           components: clippy,rustfmt
 
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -31,6 +34,35 @@ jobs:
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  supply-chain:
+    name: Supply Chain
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install supply-chain tooling
+        run: cargo install cargo-audit cargo-cyclonedx --locked
+
+      - name: Audit Rust dependencies
+        run: cargo audit
+
+      - name: Generate Rust SBOM
+        run: cargo cyclonedx --format json --override-filename rust-sbom
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-sbom
+          path: core-engines/orchestrator/rust-sbom.json
+          if-no-files-found: error
 
   automation:
     name: Automation

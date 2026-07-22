@@ -1,4 +1,4 @@
-.PHONY: local-up local-down local-logs run-orchestrator run-paperclip run-codex-scheduler fmt check check-rust check-automation check-opentofu check-workflows
+.PHONY: local-up local-down local-logs run-orchestrator run-paperclip run-codex-scheduler fmt check check-rust check-automation check-opentofu check-workflows check-supply-chain
 
 COMPOSE_FILE := infrastructure/local-dev/docker-compose.yml
 TOFU ?= tofu
@@ -24,7 +24,7 @@ run-codex-scheduler:
 fmt:
 	cargo fmt --all
 
-check: check-rust check-automation check-workflows check-opentofu
+check: check-rust check-automation check-workflows check-supply-chain check-opentofu
 
 check-rust:
 	cargo check --workspace
@@ -38,6 +38,22 @@ check-automation:
 
 check-workflows:
 	python3 tools/validate_ci_workflow.py
+
+check-supply-chain:
+	@if command -v cargo-audit >/dev/null 2>&1; then \
+		cargo audit; \
+	else \
+		echo "cargo-audit not found; skipping Rust dependency audit"; \
+	fi
+	@if command -v cargo-cyclonedx >/dev/null 2>&1; then \
+		tmp_dir=$$(mktemp -d); \
+		cargo cyclonedx --format json --override-filename rust-sbom; \
+		mv core-engines/orchestrator/rust-sbom.json "$$tmp_dir/rust-sbom.cdx.json"; \
+		test -s "$$tmp_dir/rust-sbom.cdx.json"; \
+		rm -rf "$$tmp_dir"; \
+	else \
+		echo "cargo-cyclonedx not found; skipping Rust SBOM generation"; \
+	fi
 
 check-opentofu:
 	@if command -v $(TOFU) >/dev/null 2>&1; then \
