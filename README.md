@@ -81,6 +81,8 @@ make check-opentofu
 
 The OpenTofu module renders sanitized Kubernetes Namespace, ServiceAccount, and ConfigMap contract data without requiring a live cluster or private rack details.
 
+GitHub Actions covers PR validation, release evidence packaging, supply-chain checks, and environment-gated promotion simulations. See [docs/ci-cd-workflow.md](docs/ci-cd-workflow.md).
+
 Run the official Paperclip AI server:
 
 ```bash
