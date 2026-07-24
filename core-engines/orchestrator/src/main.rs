@@ -317,11 +317,15 @@ impl MessageConsumer for KafkaBrokerAdapter {
 
         for record in self.records.drain(..) {
             if record.topic == topic.as_str() {
-                match envelope_from_kafka_record(&record) {
-                    Ok(envelope) => matched.push(envelope),
-                    Err(error) => deadletters.push(kafka_record_from_envelope(
-                        &deadletter_for_malformed_record(&record, &error, &self.config),
-                    )),
+                if matched.len() < self.config.max_poll_records as usize {
+                    match envelope_from_kafka_record(&record) {
+                        Ok(envelope) => matched.push(envelope),
+                        Err(error) => deadletters.push(kafka_record_from_envelope(
+                            &deadletter_for_malformed_record(&record, &error, &self.config),
+                        )),
+                    }
+                } else {
+                    remaining.push(record);
                 }
             } else {
                 remaining.push(record);
@@ -726,6 +730,10 @@ fn main() {
         "sample_kafka_adapter_contract={:?}",
         sample_kafka_adapter_contract(&config)
     );
+    println!(
+        "sample_kafka_load_report={:?}",
+        staged_kafka_load_report(&config, 6)
+    );
     if let Some(result) = live_kafka_smoke_from_env(&config) {
         println!("live_kafka_smoke={result}");
     }
@@ -1109,6 +1117,64 @@ fn next_delivery_attempt(envelope: &MessageEnvelope, failure: DeliveryFailure) -
             );
             retry
         }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct KafkaLoadReport {
+    published: usize,
+    first_drain: usize,
+    second_drain: usize,
+    retry_count: usize,
+    deadletter_count: usize,
+}
+
+fn staged_kafka_load_report(config: &OrchestratorConfig, published: usize) -> KafkaLoadReport {
+    let mut adapter_config = KafkaAdapterConfig::from_orchestrator_config(config);
+    adapter_config.max_poll_records = 3;
+    let mut adapter = KafkaBrokerAdapter::new(adapter_config);
+
+    for index in 0..published {
+        adapter.publish(MessageEnvelope::new(
+            KafkaTopic::AgentCommands,
+            &format!("load-agent-command-{index:03}"),
+            WorkflowState::Scheduled,
+            format!("load_test command_index={index}"),
+            config,
+        ));
+    }
+
+    let first_drain = adapter.drain_topic(KafkaTopic::AgentCommands);
+    let second_drain = adapter.drain_topic(KafkaTopic::AgentCommands);
+    let mut retry_count = 0;
+    let mut deadletter_count = 0;
+
+    for envelope in first_drain.iter().chain(second_drain.iter()) {
+        let next = if envelope.correlation_id.ends_with("000") {
+            next_delivery_attempt(
+                envelope,
+                DeliveryFailure::Permanent("load validation failure"),
+            )
+        } else {
+            next_delivery_attempt(
+                envelope,
+                DeliveryFailure::Transient("load broker backpressure"),
+            )
+        };
+
+        match next.workflow_state {
+            WorkflowState::Retrying => retry_count += 1,
+            WorkflowState::Deadlettered => deadletter_count += 1,
+            _ => {}
+        }
+    }
+
+    KafkaLoadReport {
+        published,
+        first_drain: first_drain.len(),
+        second_drain: second_drain.len(),
+        retry_count,
+        deadletter_count,
     }
 }
 
@@ -1632,6 +1698,96 @@ mod tests {
             .expect("live Kafka consume should succeed");
 
         assert!(drained.iter().any(|candidate| candidate == &envelope));
+    }
+
+    #[test]
+    fn staged_kafka_load_report_bounds_polling_and_classifies_failures() {
+        let report = staged_kafka_load_report(&config(), 6);
+
+        assert_eq!(
+            report,
+            KafkaLoadReport {
+                published: 6,
+                first_drain: 3,
+                second_drain: 3,
+                retry_count: 5,
+                deadletter_count: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn staged_kafka_adapter_respects_max_poll_records_under_load() {
+        let mut adapter_config = KafkaAdapterConfig::from_orchestrator_config(&config());
+        adapter_config.max_poll_records = 2;
+        let mut adapter = KafkaBrokerAdapter::new(adapter_config);
+
+        for index in 0..5 {
+            adapter.publish(MessageEnvelope::new(
+                KafkaTopic::AgentResults,
+                &format!("bounded-drain-{index}"),
+                WorkflowState::Scheduled,
+                format!("bounded_load index={index}"),
+                &config(),
+            ));
+        }
+
+        assert_eq!(adapter.drain_topic(KafkaTopic::AgentResults).len(), 2);
+        assert_eq!(adapter.drain_topic(KafkaTopic::AgentResults).len(), 2);
+        assert_eq!(adapter.drain_topic(KafkaTopic::AgentResults).len(), 1);
+        assert!(adapter.drain_topic(KafkaTopic::AgentResults).is_empty());
+    }
+
+    #[test]
+    fn live_kafka_load_smoke_bounds_polling_when_enabled() {
+        if env::var("ATHERNEX_KAFKA_INTEGRATION").ok().as_deref() != Some("1") {
+            return;
+        }
+
+        let mut config = config();
+        let run_id = format!(
+            "live-kafka-load-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after UNIX epoch")
+                .as_millis()
+        );
+        config.kafka_bootstrap_servers =
+            env::var("KAFKA_BOOTSTRAP_SERVERS").unwrap_or_else(|_| "127.0.0.1:9092".to_string());
+        config.max_in_flight = 4;
+
+        let mut adapter_config = KafkaAdapterConfig::from_orchestrator_config(&config);
+        adapter_config.consumer_group = format!("{}-group", run_id);
+        adapter_config.max_poll_records = 4;
+        let broker = LiveKafkaBroker::connect(adapter_config)
+            .expect("local Kafka broker should accept live client connections");
+
+        for index in 0..8 {
+            broker
+                .try_publish(&MessageEnvelope::new(
+                    KafkaTopic::SecurityFindings,
+                    &format!("{run_id}-{index:02}"),
+                    WorkflowState::Scheduled,
+                    format!("live_kafka_load_smoke run_id={run_id} index={index}"),
+                    &config,
+                ))
+                .expect("live Kafka load publish should succeed");
+        }
+
+        let mut observed = 0;
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while observed < 8 && Instant::now() < deadline {
+            let drained = broker
+                .try_drain_topic(KafkaTopic::SecurityFindings)
+                .expect("live Kafka load consume should succeed");
+            assert!(drained.len() <= 4);
+            observed += drained
+                .iter()
+                .filter(|envelope| envelope.correlation_id.starts_with(&run_id))
+                .count();
+        }
+
+        assert_eq!(observed, 8);
     }
 
     #[test]

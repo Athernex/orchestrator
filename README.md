@@ -74,6 +74,12 @@ ATHERNEX_KAFKA_INTEGRATION=1 cargo test -p orchestrator live_kafka_broker_round_
 ATHERNEX_LIVE_KAFKA_SMOKE=1 cargo run -p orchestrator
 ```
 
+Run the bounded Kafka load smoke against the local broker:
+
+```bash
+ATHERNEX_KAFKA_INTEGRATION=1 cargo test -p orchestrator live_kafka_load_smoke_bounds_polling_when_enabled
+```
+
 Run the full local validation suite:
 
 ```bash
@@ -197,6 +203,6 @@ Use sanitized component names and capability classes instead. See [architecture/
 - [x] Kubernetes scheduler adapter contracts
 - [x] Kafka adapter facade for typed producer/consumer records
 - [x] Real Kafka consumer and producer implementation
+- [x] Load tests for backpressure and retry behavior
 - [ ] Paperclip adapter implementation
-- [ ] Load tests for backpressure and retry behavior
 - [ ] Rack-specific deployment manifests kept in a private repo or encrypted vault
