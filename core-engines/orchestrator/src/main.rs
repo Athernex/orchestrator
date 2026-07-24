@@ -1,5 +1,7 @@
 use std::env;
 
+const DEFAULT_MAX_DELIVERY_ATTEMPTS: u32 = 3;
+
 #[derive(Debug)]
 struct OrchestratorConfig {
     project_name: String,
@@ -36,7 +38,7 @@ impl OrchestratorConfig {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum WorkflowState {
     Received,
     Validated,
@@ -47,6 +49,128 @@ enum WorkflowState {
     Retrying,
     Quarantined,
     Deadlettered,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KafkaTopic {
+    AgentCommands,
+    AgentObservations,
+    AgentResults,
+    AgentReview,
+    AgentDeadletter,
+    SchedulerCapacity,
+    PowerCommands,
+    PowerObservations,
+    SecurityFindings,
+    AgentAudit,
+}
+
+impl KafkaTopic {
+    fn as_str(self) -> &'static str {
+        match self {
+            KafkaTopic::AgentCommands => "agent.commands",
+            KafkaTopic::AgentObservations => "agent.observations",
+            KafkaTopic::AgentResults => "agent.results",
+            KafkaTopic::AgentReview => "agent.review",
+            KafkaTopic::AgentDeadletter => "agent.deadletter",
+            KafkaTopic::SchedulerCapacity => "scheduler.capacity",
+            KafkaTopic::PowerCommands => "power.commands",
+            KafkaTopic::PowerObservations => "power.observations",
+            KafkaTopic::SecurityFindings => "security.findings",
+            KafkaTopic::AgentAudit => "agent.audit",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MessageEnvelope {
+    topic: KafkaTopic,
+    idempotency_key: String,
+    correlation_id: String,
+    workflow_state: WorkflowState,
+    attempt: u32,
+    max_attempts: u32,
+    payload: String,
+}
+
+impl MessageEnvelope {
+    fn new(
+        topic: KafkaTopic,
+        run_id: &str,
+        workflow_state: WorkflowState,
+        payload: String,
+        config: &OrchestratorConfig,
+    ) -> Self {
+        Self {
+            topic,
+            idempotency_key: format!("{run_id}:{}", topic.as_str()),
+            correlation_id: run_id.to_string(),
+            workflow_state,
+            attempt: 1,
+            max_attempts: config.retry_limit.max(DEFAULT_MAX_DELIVERY_ATTEMPTS),
+            payload,
+        }
+    }
+
+    fn with_delivery_failure(&self, topic: KafkaTopic, reason: &str) -> Self {
+        Self {
+            topic,
+            idempotency_key: format!("{}:{}", self.correlation_id, topic.as_str()),
+            correlation_id: self.correlation_id.clone(),
+            workflow_state: WorkflowState::Deadlettered,
+            attempt: self.attempt,
+            max_attempts: self.max_attempts,
+            payload: format!(
+                "delivery_failed source_topic={} reason={} payload={}",
+                self.topic.as_str(),
+                reason,
+                self.payload
+            ),
+        }
+    }
+}
+
+trait MessageProducer {
+    fn publish(&mut self, envelope: MessageEnvelope);
+}
+
+trait MessageConsumer {
+    fn drain_topic(&mut self, topic: KafkaTopic) -> Vec<MessageEnvelope>;
+}
+
+#[derive(Debug, Default)]
+struct InMemoryBroker {
+    envelopes: Vec<MessageEnvelope>,
+}
+
+impl MessageProducer for InMemoryBroker {
+    fn publish(&mut self, envelope: MessageEnvelope) {
+        self.envelopes.push(envelope);
+    }
+}
+
+impl MessageConsumer for InMemoryBroker {
+    fn drain_topic(&mut self, topic: KafkaTopic) -> Vec<MessageEnvelope> {
+        let mut matched = Vec::new();
+        let mut remaining = Vec::new();
+
+        for envelope in self.envelopes.drain(..) {
+            if envelope.topic == topic {
+                matched.push(envelope);
+            } else {
+                remaining.push(envelope);
+            }
+        }
+
+        self.envelopes = remaining;
+        matched
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DeliveryFailure {
+    Transient(&'static str),
+    Permanent(&'static str),
 }
 
 #[derive(Debug)]
@@ -120,6 +244,7 @@ fn main() {
     println!("retry_limit={}", config.retry_limit);
     println!("workflow_states={:?}", workflow_states());
     println!("kafka_topics={:?}", kafka_topics());
+    println!("sample_kafka_contract={:?}", sample_kafka_contract(&config));
     for decision in sample_scheduling_decisions(&config) {
         println!(
             "sample_scheduling_decision={}",
@@ -138,6 +263,40 @@ fn main() {
     ) {
         println!("sample_idle_decision={}", describe_decision(&decision));
     }
+}
+
+fn sample_kafka_contract(config: &OrchestratorConfig) -> Vec<MessageEnvelope> {
+    let mut broker = InMemoryBroker::default();
+    let power_command = publish_scheduling_observation(
+        &mut broker,
+        &JobRequest {
+            run_id: "batch-remote-001",
+            required_slots: 4,
+            priority: JobPriority::Batch,
+            allows_remote_capacity: true,
+        },
+        &CapacitySnapshot {
+            local_available_slots: config.local_capacity_slots,
+            remote_online_slots: 0,
+            remote_powering_slots: 0,
+            idle_seconds: 0,
+        },
+        config,
+    );
+    let mut exhausted_command = power_command.clone();
+    exhausted_command.attempt = exhausted_command.max_attempts;
+    broker.publish(next_delivery_attempt(
+        &exhausted_command,
+        DeliveryFailure::Transient("sample broker timeout"),
+    ));
+    broker.publish(next_delivery_attempt(
+        &power_command,
+        DeliveryFailure::Permanent("sample invalid envelope"),
+    ));
+
+    let mut sample = broker.drain_topic(KafkaTopic::PowerCommands);
+    sample.extend(broker.drain_topic(KafkaTopic::AgentDeadletter));
+    sample
 }
 
 fn sample_scheduling_decisions(config: &OrchestratorConfig) -> [SchedulingDecision; 3] {
@@ -206,17 +365,77 @@ fn workflow_states() -> [WorkflowState; 9] {
 
 fn kafka_topics() -> [&'static str; 10] {
     [
-        "agent.commands",
-        "agent.observations",
-        "agent.results",
-        "agent.review",
-        "agent.deadletter",
-        "scheduler.capacity",
-        "power.commands",
-        "power.observations",
-        "security.findings",
-        "agent.audit",
+        KafkaTopic::AgentCommands.as_str(),
+        KafkaTopic::AgentObservations.as_str(),
+        KafkaTopic::AgentResults.as_str(),
+        KafkaTopic::AgentReview.as_str(),
+        KafkaTopic::AgentDeadletter.as_str(),
+        KafkaTopic::SchedulerCapacity.as_str(),
+        KafkaTopic::PowerCommands.as_str(),
+        KafkaTopic::PowerObservations.as_str(),
+        KafkaTopic::SecurityFindings.as_str(),
+        KafkaTopic::AgentAudit.as_str(),
     ]
+}
+
+fn publish_scheduling_observation(
+    producer: &mut impl MessageProducer,
+    job: &JobRequest,
+    capacity: &CapacitySnapshot,
+    config: &OrchestratorConfig,
+) -> MessageEnvelope {
+    let decision = decide_capacity_action(job, capacity, config);
+    let envelope = envelope_for_decision(job.run_id, &decision, config);
+
+    producer.publish(envelope.clone());
+    envelope
+}
+
+fn envelope_for_decision(
+    run_id: &str,
+    decision: &SchedulingDecision,
+    config: &OrchestratorConfig,
+) -> MessageEnvelope {
+    let topic = match decision {
+        SchedulingDecision::RunHere { .. } | SchedulingDecision::DispatchRemote { .. } => {
+            KafkaTopic::AgentCommands
+        }
+        SchedulingDecision::RequestPowerOn { .. } | SchedulingDecision::RequestPowerOff { .. } => {
+            KafkaTopic::PowerCommands
+        }
+        SchedulingDecision::Hold { .. } => KafkaTopic::SchedulerCapacity,
+    };
+
+    MessageEnvelope::new(
+        topic,
+        run_id,
+        WorkflowState::Scheduled,
+        describe_decision(decision),
+        config,
+    )
+}
+
+fn next_delivery_attempt(envelope: &MessageEnvelope, failure: DeliveryFailure) -> MessageEnvelope {
+    match failure {
+        DeliveryFailure::Permanent(reason) => {
+            envelope.with_delivery_failure(KafkaTopic::AgentDeadletter, reason)
+        }
+        DeliveryFailure::Transient(reason) if envelope.attempt >= envelope.max_attempts => {
+            envelope.with_delivery_failure(KafkaTopic::AgentDeadletter, reason)
+        }
+        DeliveryFailure::Transient(reason) => {
+            let mut retry = envelope.clone();
+            retry.workflow_state = WorkflowState::Retrying;
+            retry.attempt += 1;
+            retry.payload = format!(
+                "retry source_topic={} reason={} payload={}",
+                envelope.topic.as_str(),
+                reason,
+                envelope.payload
+            );
+            retry
+        }
+    }
 }
 
 fn decide_capacity_action(
@@ -468,5 +687,120 @@ mod tests {
         assert!(topics.contains(&"agent.review"));
         assert!(topics.contains(&"agent.audit"));
         assert!(topics.contains(&"agent.deadletter"));
+    }
+
+    #[test]
+    fn power_on_decisions_publish_to_power_commands() {
+        let mut broker = InMemoryBroker::default();
+        let envelope = publish_scheduling_observation(
+            &mut broker,
+            &JobRequest {
+                run_id: "batch-remote-001",
+                required_slots: 4,
+                priority: JobPriority::Batch,
+                allows_remote_capacity: true,
+            },
+            &CapacitySnapshot {
+                local_available_slots: 2,
+                remote_online_slots: 0,
+                remote_powering_slots: 0,
+                idle_seconds: 0,
+            },
+            &config(),
+        );
+
+        let power_commands = broker.drain_topic(KafkaTopic::PowerCommands);
+
+        assert_eq!(envelope.topic, KafkaTopic::PowerCommands);
+        assert_eq!(power_commands.len(), 1);
+        assert_eq!(power_commands[0].correlation_id, "batch-remote-001");
+        assert!(power_commands[0].payload.contains("request_power_on"));
+        assert!(broker.drain_topic(KafkaTopic::AgentCommands).is_empty());
+    }
+
+    #[test]
+    fn hold_decisions_publish_to_scheduler_capacity() {
+        let mut broker = InMemoryBroker::default();
+        let envelope = publish_scheduling_observation(
+            &mut broker,
+            &JobRequest {
+                run_id: "small-remote-001",
+                required_slots: 2,
+                priority: JobPriority::Batch,
+                allows_remote_capacity: true,
+            },
+            &CapacitySnapshot {
+                local_available_slots: 0,
+                remote_online_slots: 0,
+                remote_powering_slots: 0,
+                idle_seconds: 0,
+            },
+            &config(),
+        );
+
+        assert_eq!(envelope.topic, KafkaTopic::SchedulerCapacity);
+        assert_eq!(
+            broker.drain_topic(KafkaTopic::SchedulerCapacity)[0].payload,
+            "hold run_id=small-remote-001 reason=below remote wake threshold"
+        );
+    }
+
+    #[test]
+    fn transient_delivery_failure_retries_on_original_topic() {
+        let envelope = MessageEnvelope::new(
+            KafkaTopic::AgentCommands,
+            "interactive-local-001",
+            WorkflowState::Scheduled,
+            "run_here run_id=interactive-local-001 slots=1".to_string(),
+            &config(),
+        );
+
+        let retry = next_delivery_attempt(&envelope, DeliveryFailure::Transient("broker timeout"));
+
+        assert_eq!(retry.topic, KafkaTopic::AgentCommands);
+        assert_eq!(retry.workflow_state, WorkflowState::Retrying);
+        assert_eq!(retry.attempt, 2);
+        assert_eq!(retry.correlation_id, envelope.correlation_id);
+        assert!(retry.payload.contains("broker timeout"));
+    }
+
+    #[test]
+    fn exhausted_transient_failure_routes_to_deadletter() {
+        let mut envelope = MessageEnvelope::new(
+            KafkaTopic::PowerCommands,
+            "batch-remote-001",
+            WorkflowState::Scheduled,
+            "request_power_on run_id=batch-remote-001 target_group=worker-group-a slots=4"
+                .to_string(),
+            &config(),
+        );
+        envelope.attempt = envelope.max_attempts;
+
+        let deadletter =
+            next_delivery_attempt(&envelope, DeliveryFailure::Transient("broker timeout"));
+
+        assert_eq!(deadletter.topic, KafkaTopic::AgentDeadletter);
+        assert_eq!(deadletter.workflow_state, WorkflowState::Deadlettered);
+        assert_eq!(deadletter.correlation_id, "batch-remote-001");
+        assert!(deadletter.payload.contains("source_topic=power.commands"));
+    }
+
+    #[test]
+    fn permanent_delivery_failure_routes_to_deadletter_immediately() {
+        let envelope = MessageEnvelope::new(
+            KafkaTopic::SchedulerCapacity,
+            "maintenance-001",
+            WorkflowState::Scheduled,
+            "hold run_id=maintenance-001 reason=promotion window required".to_string(),
+            &config(),
+        );
+
+        let deadletter =
+            next_delivery_attempt(&envelope, DeliveryFailure::Permanent("invalid envelope"));
+
+        assert_eq!(deadletter.topic, KafkaTopic::AgentDeadletter);
+        assert_eq!(deadletter.workflow_state, WorkflowState::Deadlettered);
+        assert_eq!(deadletter.attempt, 1);
+        assert!(deadletter.payload.contains("invalid envelope"));
     }
 }

@@ -15,21 +15,23 @@ This file is the MRGI working ledger for detachable Codex repo-improvement loops
 ## Current Stage
 
 - [x] Hygiene: inspect repo state, clean stale task notes, identify the next best task
-- [ ] Stage 2: implement the selected focused task to working state
-- [ ] Stage 2: verify deeply enough to decide whether the task deserves a checkmark
+- [x] Stage 2: implement the selected focused task to working state
+- [x] Stage 2: verify deeply enough to decide whether the task deserves a checkmark
+- [x] Stage 3: update repo ledger, commit verified work, and report the boomerang verdict
 
 ## Task List
 
-- [ ] Implement a public-safe Kafka producer/consumer contract slice in the Rust orchestrator
+- [ ] Add Kubernetes scheduler adapter contract tests for node lifecycle handoff
 
 ## Active Attempt
 
-- Task: Select the next showcase task from README.md and repository structure
-- Stage: Stage 1 hygiene and next-task selection
-- Last result: Selected the Rust Kafka producer/consumer contract slice as the next task because it best demonstrates distributed-systems orchestration, typed workflow boundaries, failure handling, and public-safe infrastructure design.
+- Task: Implement a public-safe Kafka producer/consumer contract slice in the Rust orchestrator
+- Stage: Stage 3 boomerang
+- Last result: Added typed Kafka topic/envelope contracts, producer/consumer traits, an in-memory broker, scheduling-to-topic routing, retry/dead-letter handling, and tests. Verified with `make check`.
 - Last failure: None
-- Next attempt: In Stage 2, add the smallest working Kafka-facing slice: typed command/observation envelopes, producer/consumer boundary traits or adapters, tests for routing and dead-letter behavior, and README/CODEX updates after verification.
+- Next attempt: Add Kubernetes scheduler adapter contract tests for sanitized node lifecycle handoff events without private manifests.
 
 ## Completed Log
 
+- 2026-07-24: Completed full boomerang cycle for the public-safe Kafka producer/consumer contract slice. Added typed Rust Kafka topics, message envelopes with idempotency/correlation metadata, producer/consumer traits, an in-memory broker, scheduling decision routing, retry and dead-letter behavior, and 5 focused tests. Verified with `make check`; optional `cargo-audit`, `cargo-cyclonedx`, and OpenTofu checks were skipped because the tools are not installed.
 - 2026-07-23: Completed Stage 1 hygiene. Confirmed `CODEX.md` exists, `.mrgi` is ignored, inspected README.md and repository structure, and selected the next showcase task.
