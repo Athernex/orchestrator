@@ -80,6 +80,22 @@ impl KafkaTopic {
             KafkaTopic::AgentAudit => "agent.audit",
         }
     }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "agent.commands" => Some(KafkaTopic::AgentCommands),
+            "agent.observations" => Some(KafkaTopic::AgentObservations),
+            "agent.results" => Some(KafkaTopic::AgentResults),
+            "agent.review" => Some(KafkaTopic::AgentReview),
+            "agent.deadletter" => Some(KafkaTopic::AgentDeadletter),
+            "scheduler.capacity" => Some(KafkaTopic::SchedulerCapacity),
+            "power.commands" => Some(KafkaTopic::PowerCommands),
+            "power.observations" => Some(KafkaTopic::PowerObservations),
+            "security.findings" => Some(KafkaTopic::SecurityFindings),
+            "agent.audit" => Some(KafkaTopic::AgentAudit),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,6 +146,37 @@ impl MessageEnvelope {
     }
 }
 
+impl WorkflowState {
+    fn as_str(&self) -> &'static str {
+        match self {
+            WorkflowState::Received => "received",
+            WorkflowState::Validated => "validated",
+            WorkflowState::Scheduled => "scheduled",
+            WorkflowState::Running => "running",
+            WorkflowState::Reviewing => "reviewing",
+            WorkflowState::Accepted => "accepted",
+            WorkflowState::Retrying => "retrying",
+            WorkflowState::Quarantined => "quarantined",
+            WorkflowState::Deadlettered => "deadlettered",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "received" => Some(WorkflowState::Received),
+            "validated" => Some(WorkflowState::Validated),
+            "scheduled" => Some(WorkflowState::Scheduled),
+            "running" => Some(WorkflowState::Running),
+            "reviewing" => Some(WorkflowState::Reviewing),
+            "accepted" => Some(WorkflowState::Accepted),
+            "retrying" => Some(WorkflowState::Retrying),
+            "quarantined" => Some(WorkflowState::Quarantined),
+            "deadlettered" => Some(WorkflowState::Deadlettered),
+            _ => None,
+        }
+    }
+}
+
 trait MessageProducer {
     fn publish(&mut self, envelope: MessageEnvelope);
 }
@@ -164,6 +211,196 @@ impl MessageConsumer for InMemoryBroker {
 
         self.envelopes = remaining;
         matched
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct KafkaAdapterConfig {
+    bootstrap_servers: String,
+    client_id: String,
+    consumer_group: String,
+    max_poll_records: u32,
+    max_delivery_attempts: u32,
+}
+
+impl KafkaAdapterConfig {
+    fn from_orchestrator_config(config: &OrchestratorConfig) -> Self {
+        Self {
+            bootstrap_servers: config.kafka_bootstrap_servers.clone(),
+            client_id: format!(
+                "{}-orchestrator",
+                sanitize_kubernetes_label(&config.control_plane_role)
+            ),
+            consumer_group: format!(
+                "{}-scheduler",
+                sanitize_kubernetes_label(&config.control_plane_role)
+            ),
+            max_poll_records: config.max_in_flight.max(1),
+            max_delivery_attempts: config.retry_limit.max(DEFAULT_MAX_DELIVERY_ATTEMPTS),
+        }
+    }
+
+    fn bootstrap_servers(&self) -> Vec<&str> {
+        self.bootstrap_servers
+            .split(',')
+            .map(str::trim)
+            .filter(|server| !server.is_empty())
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct KafkaRecord {
+    topic: String,
+    key: String,
+    headers: Vec<(String, String)>,
+    payload: String,
+}
+
+impl KafkaRecord {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum KafkaRecordError {
+    UnknownTopic,
+    MissingHeader(&'static str),
+    InvalidWorkflowState,
+    InvalidAttempt,
+    InvalidMaxAttempts,
+}
+
+#[derive(Debug)]
+struct KafkaBrokerAdapter {
+    config: KafkaAdapterConfig,
+    records: Vec<KafkaRecord>,
+}
+
+impl KafkaBrokerAdapter {
+    fn new(config: KafkaAdapterConfig) -> Self {
+        Self {
+            config,
+            records: Vec::new(),
+        }
+    }
+
+    fn publish_record(&mut self, record: KafkaRecord) {
+        self.records.push(record);
+    }
+}
+
+impl MessageProducer for KafkaBrokerAdapter {
+    fn publish(&mut self, envelope: MessageEnvelope) {
+        self.records.push(kafka_record_from_envelope(&envelope));
+    }
+}
+
+impl MessageConsumer for KafkaBrokerAdapter {
+    fn drain_topic(&mut self, topic: KafkaTopic) -> Vec<MessageEnvelope> {
+        let mut matched = Vec::new();
+        let mut remaining = Vec::new();
+        let mut deadletters = Vec::new();
+
+        for record in self.records.drain(..) {
+            if record.topic == topic.as_str() {
+                match envelope_from_kafka_record(&record) {
+                    Ok(envelope) => matched.push(envelope),
+                    Err(error) => deadletters.push(kafka_record_from_envelope(
+                        &deadletter_for_malformed_record(&record, &error, &self.config),
+                    )),
+                }
+            } else {
+                remaining.push(record);
+            }
+        }
+
+        remaining.extend(deadletters);
+        self.records = remaining;
+        matched
+    }
+}
+
+fn kafka_record_from_envelope(envelope: &MessageEnvelope) -> KafkaRecord {
+    KafkaRecord {
+        topic: envelope.topic.as_str().to_string(),
+        key: envelope.idempotency_key.clone(),
+        headers: vec![
+            (
+                "correlation_id".to_string(),
+                envelope.correlation_id.clone(),
+            ),
+            (
+                "workflow_state".to_string(),
+                envelope.workflow_state.as_str().to_string(),
+            ),
+            ("attempt".to_string(), envelope.attempt.to_string()),
+            (
+                "max_attempts".to_string(),
+                envelope.max_attempts.to_string(),
+            ),
+        ],
+        payload: envelope.payload.clone(),
+    }
+}
+
+fn envelope_from_kafka_record(record: &KafkaRecord) -> Result<MessageEnvelope, KafkaRecordError> {
+    let topic = KafkaTopic::from_str(&record.topic).ok_or(KafkaRecordError::UnknownTopic)?;
+    let correlation_id = required_header(record, "correlation_id")?.to_string();
+    let workflow_state = WorkflowState::from_str(required_header(record, "workflow_state")?)
+        .ok_or(KafkaRecordError::InvalidWorkflowState)?;
+    let attempt = required_header(record, "attempt")?
+        .parse::<u32>()
+        .map_err(|_| KafkaRecordError::InvalidAttempt)?;
+    let max_attempts = required_header(record, "max_attempts")?
+        .parse::<u32>()
+        .map_err(|_| KafkaRecordError::InvalidMaxAttempts)?;
+
+    Ok(MessageEnvelope {
+        topic,
+        idempotency_key: record.key.clone(),
+        correlation_id,
+        workflow_state,
+        attempt,
+        max_attempts,
+        payload: record.payload.clone(),
+    })
+}
+
+fn required_header<'a>(
+    record: &'a KafkaRecord,
+    name: &'static str,
+) -> Result<&'a str, KafkaRecordError> {
+    record
+        .header(name)
+        .ok_or(KafkaRecordError::MissingHeader(name))
+}
+
+fn deadletter_for_malformed_record(
+    record: &KafkaRecord,
+    error: &KafkaRecordError,
+    config: &KafkaAdapterConfig,
+) -> MessageEnvelope {
+    let correlation_id = record
+        .header("correlation_id")
+        .unwrap_or("unknown-correlation")
+        .to_string();
+
+    MessageEnvelope {
+        topic: KafkaTopic::AgentDeadletter,
+        idempotency_key: format!("{correlation_id}:{}", KafkaTopic::AgentDeadletter.as_str()),
+        correlation_id,
+        workflow_state: WorkflowState::Deadlettered,
+        attempt: 1,
+        max_attempts: config.max_delivery_attempts,
+        payload: format!(
+            "malformed_kafka_record source_topic={} key={} error={error:?}",
+            record.topic, record.key
+        ),
     }
 }
 
@@ -286,6 +523,11 @@ fn main() {
     println!("workflow_states={:?}", workflow_states());
     println!("kafka_topics={:?}", kafka_topics());
     println!("sample_kafka_contract={:?}", sample_kafka_contract(&config));
+    println!("kafka_adapter={}", kafka_adapter_summary(&config));
+    println!(
+        "sample_kafka_adapter_contract={:?}",
+        sample_kafka_adapter_contract(&config)
+    );
     for decision in sample_scheduling_decisions(&config) {
         println!(
             "sample_scheduling_decision={}",
@@ -340,6 +582,57 @@ fn sample_kafka_contract(config: &OrchestratorConfig) -> Vec<MessageEnvelope> {
 
     let mut sample = broker.drain_topic(KafkaTopic::PowerCommands);
     sample.extend(broker.drain_topic(KafkaTopic::AgentDeadletter));
+    sample
+}
+
+fn kafka_adapter_summary(config: &OrchestratorConfig) -> String {
+    let adapter_config = KafkaAdapterConfig::from_orchestrator_config(config);
+    format!(
+        "bootstrap_servers={:?} client_id={} consumer_group={} max_poll_records={} max_delivery_attempts={}",
+        adapter_config.bootstrap_servers(),
+        adapter_config.client_id,
+        adapter_config.consumer_group,
+        adapter_config.max_poll_records,
+        adapter_config.max_delivery_attempts
+    )
+}
+
+fn sample_kafka_adapter_contract(config: &OrchestratorConfig) -> Vec<MessageEnvelope> {
+    let adapter_config = KafkaAdapterConfig::from_orchestrator_config(config);
+    let mut adapter = KafkaBrokerAdapter::new(adapter_config);
+    let power_command = MessageEnvelope::new(
+        KafkaTopic::PowerCommands,
+        "adapter-sample-001",
+        WorkflowState::Scheduled,
+        "request_power_on run_id=adapter-sample-001 target_group=worker-group-a slots=4"
+            .to_string(),
+        config,
+    );
+
+    adapter.publish(power_command);
+    adapter.publish_record(KafkaRecord {
+        topic: KafkaTopic::PowerCommands.as_str().to_string(),
+        key: "adapter-malformed-sample".to_string(),
+        headers: vec![
+            (
+                "correlation_id".to_string(),
+                "adapter-malformed-sample".to_string(),
+            ),
+            ("workflow_state".to_string(), "scheduled".to_string()),
+            ("attempt".to_string(), "not-a-number".to_string()),
+            (
+                "max_attempts".to_string(),
+                config
+                    .retry_limit
+                    .max(DEFAULT_MAX_DELIVERY_ATTEMPTS)
+                    .to_string(),
+            ),
+        ],
+        payload: "malformed sample payload omitted from dead letter".to_string(),
+    });
+
+    let mut sample = adapter.drain_topic(KafkaTopic::PowerCommands);
+    sample.extend(adapter.drain_topic(KafkaTopic::AgentDeadletter));
     sample
 }
 
@@ -951,6 +1244,109 @@ mod tests {
         assert_eq!(deadletter.workflow_state, WorkflowState::Deadlettered);
         assert_eq!(deadletter.attempt, 1);
         assert!(deadletter.payload.contains("invalid envelope"));
+    }
+
+    #[test]
+    fn kafka_adapter_config_sanitizes_client_and_group_names() {
+        let mut config = config();
+        config.control_plane_role = "Control Plane__Review.Stage!!".to_string();
+        config.kafka_bootstrap_servers = "127.0.0.1:9092, kafka.local:9092 ".to_string();
+
+        let adapter_config = KafkaAdapterConfig::from_orchestrator_config(&config);
+
+        assert_eq!(
+            adapter_config.client_id,
+            "control-plane-review-stage-orchestrator"
+        );
+        assert_eq!(
+            adapter_config.consumer_group,
+            "control-plane-review-stage-scheduler"
+        );
+        assert_eq!(
+            adapter_config.bootstrap_servers(),
+            vec!["127.0.0.1:9092", "kafka.local:9092"]
+        );
+        assert_eq!(adapter_config.max_poll_records, 8);
+    }
+
+    #[test]
+    fn kafka_record_round_trip_preserves_typed_envelope_metadata() {
+        let envelope = MessageEnvelope::new(
+            KafkaTopic::PowerCommands,
+            "batch-remote-001",
+            WorkflowState::Scheduled,
+            "request_power_on run_id=batch-remote-001 target_group=worker-group-a slots=4"
+                .to_string(),
+            &config(),
+        );
+
+        let record = kafka_record_from_envelope(&envelope);
+        let decoded =
+            envelope_from_kafka_record(&record).expect("adapter record should decode cleanly");
+
+        assert_eq!(record.topic, "power.commands");
+        assert_eq!(record.key, "batch-remote-001:power.commands");
+        assert_eq!(record.header("correlation_id"), Some("batch-remote-001"));
+        assert_eq!(record.header("workflow_state"), Some("scheduled"));
+        assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn kafka_broker_adapter_implements_existing_message_traits() {
+        let mut adapter =
+            KafkaBrokerAdapter::new(KafkaAdapterConfig::from_orchestrator_config(&config()));
+
+        let envelope = publish_scheduling_observation(
+            &mut adapter,
+            &JobRequest {
+                run_id: "batch-remote-001",
+                required_slots: 4,
+                priority: JobPriority::Batch,
+                allows_remote_capacity: true,
+            },
+            &CapacitySnapshot {
+                local_available_slots: 2,
+                remote_online_slots: 0,
+                remote_powering_slots: 0,
+                idle_seconds: 0,
+            },
+            &config(),
+        );
+
+        let drained = adapter.drain_topic(KafkaTopic::PowerCommands);
+
+        assert_eq!(drained, vec![envelope]);
+        assert!(adapter.drain_topic(KafkaTopic::PowerCommands).is_empty());
+    }
+
+    #[test]
+    fn malformed_kafka_record_routes_to_deadletter_without_payload_echo() {
+        let mut adapter =
+            KafkaBrokerAdapter::new(KafkaAdapterConfig::from_orchestrator_config(&config()));
+        adapter.publish_record(KafkaRecord {
+            topic: "power.commands".to_string(),
+            key: "unsafe-private-record".to_string(),
+            headers: vec![
+                (
+                    "correlation_id".to_string(),
+                    "malformed-record-001".to_string(),
+                ),
+                ("workflow_state".to_string(), "scheduled".to_string()),
+                ("attempt".to_string(), "not-a-number".to_string()),
+                ("max_attempts".to_string(), "3".to_string()),
+            ],
+            payload: "rack=private ipmi=private payload must not be copied".to_string(),
+        });
+
+        assert!(adapter.drain_topic(KafkaTopic::PowerCommands).is_empty());
+
+        let deadletters = adapter.drain_topic(KafkaTopic::AgentDeadletter);
+        assert_eq!(deadletters.len(), 1);
+        assert_eq!(deadletters[0].topic, KafkaTopic::AgentDeadletter);
+        assert_eq!(deadletters[0].correlation_id, "malformed-record-001");
+        assert!(deadletters[0].payload.contains("InvalidAttempt"));
+        assert!(!deadletters[0].payload.contains("ipmi=private"));
+        assert!(!deadletters[0].payload.contains("rack=private"));
     }
 
     #[test]

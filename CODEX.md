@@ -21,18 +21,19 @@ This file is the MRGI working ledger for detachable Codex repo-improvement loops
 
 ## Task List
 
-- [ ] Add a real Kafka producer/consumer adapter skeleton behind the existing broker traits
+- [ ] Add a live Kafka client implementation behind the adapter facade
 
 ## Active Attempt
 
-- Task: Add Kubernetes scheduler adapter contract tests for node lifecycle handoff
+- Task: Add a real Kafka producer/consumer adapter skeleton behind the existing broker traits
 - Stage: Stage 3 boomerang
-- Last result: Added typed Kubernetes node lifecycle handoff events for scheduler power-on and idle power-off decisions, namespace sanitization, sample orchestrator output, and public-safety contract tests. Verified with `make check`.
+- Last result: Added a typed Kafka adapter facade behind the existing producer/consumer traits, including sanitized adapter config, envelope-to-record conversion, record decoding, malformed-record dead-letter routing, sample orchestrator output, and focused tests. Verified with `make check`.
 - Last failure: None
-- Next attempt: Add a minimal real Kafka producer/consumer adapter skeleton behind the existing broker traits while preserving the in-memory broker for tests.
+- Next attempt: Add a live Kafka client implementation behind the adapter facade, gated so local tests can keep using the in-memory and staged adapter paths.
 
 ## Completed Log
 
+- 2026-07-24: Completed the real Kafka producer/consumer adapter skeleton behind the existing broker traits. Added sanitized adapter configuration, typed Kafka record headers, envelope round-tripping, a staged `KafkaBrokerAdapter`, malformed-record dead-letter routing that avoids payload echo, sample orchestrator output, and 4 focused tests. Verified with `make check`; optional `cargo-audit` and OpenTofu checks were skipped because the tools are not installed.
 - 2026-07-24: Completed Kubernetes scheduler adapter contract tests for node lifecycle handoff. Added sanitized Rust lifecycle handoff events for remote capacity admission and cordon actions, namespace normalization, sample output, and tests proving local/hold decisions do not create Kubernetes node lifecycle events or leak private node details. Verified with `make check`; optional `cargo-audit`, `cargo-cyclonedx`, and OpenTofu checks were skipped because the tools are not installed.
 - 2026-07-24: Completed full boomerang cycle for the public-safe Kafka producer/consumer contract slice. Added typed Rust Kafka topics, message envelopes with idempotency/correlation metadata, producer/consumer traits, an in-memory broker, scheduling decision routing, retry and dead-letter behavior, and 5 focused tests. Verified with `make check`; optional `cargo-audit`, `cargo-cyclonedx`, and OpenTofu checks were skipped because the tools are not installed.
 - 2026-07-23: Completed Stage 1 hygiene. Confirmed `CODEX.md` exists, `.mrgi` is ignored, inspected README.md and repository structure, and selected the next showcase task.

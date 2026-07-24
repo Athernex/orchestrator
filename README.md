@@ -186,6 +186,7 @@ Use sanitized component names and capability classes instead. See [architecture/
 - [x] Automation validation wired into `make check`
 - [x] Public-safe Kafka producer/consumer contract slice
 - [x] Kubernetes scheduler adapter contracts
+- [x] Kafka adapter facade for typed producer/consumer records
 - [ ] Real Kafka consumer and producer implementation
 - [ ] Paperclip adapter implementation
 - [ ] Load tests for backpressure and retry behavior
