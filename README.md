@@ -185,8 +185,8 @@ Use sanitized component names and capability classes instead. See [architecture/
 - [x] Local Codex scheduler bridge for gated `codex --yolo` improvement runs
 - [x] Automation validation wired into `make check`
 - [x] Public-safe Kafka producer/consumer contract slice
+- [x] Kubernetes scheduler adapter contracts
 - [ ] Real Kafka consumer and producer implementation
-- [ ] Kubernetes scheduler adapter contracts
 - [ ] Paperclip adapter implementation
 - [ ] Load tests for backpressure and retry behavior
 - [ ] Rack-specific deployment manifests kept in a private repo or encrypted vault

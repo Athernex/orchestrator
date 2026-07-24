@@ -221,6 +221,47 @@ enum SchedulingDecision {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KubernetesNodeLifecycleAction {
+    AdmitRemoteCapacity,
+    CordonRemoteCapacity,
+}
+
+impl KubernetesNodeLifecycleAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            KubernetesNodeLifecycleAction::AdmitRemoteCapacity => "admit_remote_capacity",
+            KubernetesNodeLifecycleAction::CordonRemoteCapacity => "cordon_remote_capacity",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct KubernetesNodeLifecycleEvent {
+    namespace: String,
+    service_account: String,
+    action: KubernetesNodeLifecycleAction,
+    target_group: &'static str,
+    correlation_id: String,
+    required_slots: u32,
+    public_reason: String,
+}
+
+impl KubernetesNodeLifecycleEvent {
+    fn payload(&self) -> String {
+        format!(
+            "kubernetes_node_lifecycle namespace={} service_account={} action={} target_group={} correlation_id={} required_slots={} reason={}",
+            self.namespace,
+            self.service_account,
+            self.action.as_str(),
+            self.target_group,
+            self.correlation_id,
+            self.required_slots,
+            self.public_reason
+        )
+    }
+}
+
 fn main() {
     let config = OrchestratorConfig::from_env();
 
@@ -250,6 +291,9 @@ fn main() {
             "sample_scheduling_decision={}",
             describe_decision(&decision)
         );
+    }
+    for event in sample_kubernetes_lifecycle_events(&config) {
+        println!("sample_kubernetes_lifecycle_event={}", event.payload());
     }
 
     if let Some(decision) = decide_idle_action(
@@ -349,6 +393,34 @@ fn sample_scheduling_decisions(config: &OrchestratorConfig) -> [SchedulingDecisi
     ]
 }
 
+fn sample_kubernetes_lifecycle_events(
+    config: &OrchestratorConfig,
+) -> Vec<KubernetesNodeLifecycleEvent> {
+    let mut events = Vec::new();
+
+    for decision in sample_scheduling_decisions(config) {
+        if let Some(event) = kubernetes_lifecycle_event_for_decision(&decision, config) {
+            events.push(event);
+        }
+    }
+
+    if let Some(decision) = decide_idle_action(
+        &CapacitySnapshot {
+            local_available_slots: config.local_capacity_slots,
+            remote_online_slots: 4,
+            remote_powering_slots: 0,
+            idle_seconds: config.idle_powerdown_after_seconds + 1,
+        },
+        config,
+    ) {
+        if let Some(event) = kubernetes_lifecycle_event_for_decision(&decision, config) {
+            events.push(event);
+        }
+    }
+
+    events
+}
+
 fn workflow_states() -> [WorkflowState; 9] {
     [
         WorkflowState::Received,
@@ -376,6 +448,83 @@ fn kafka_topics() -> [&'static str; 10] {
         KafkaTopic::SecurityFindings.as_str(),
         KafkaTopic::AgentAudit.as_str(),
     ]
+}
+
+fn kubernetes_lifecycle_event_for_decision(
+    decision: &SchedulingDecision,
+    config: &OrchestratorConfig,
+) -> Option<KubernetesNodeLifecycleEvent> {
+    match decision {
+        SchedulingDecision::RequestPowerOn {
+            run_id,
+            target_group,
+            slots,
+        } => Some(KubernetesNodeLifecycleEvent {
+            namespace: kubernetes_namespace_for_config(config),
+            service_account: "athernex-orchestrator".to_string(),
+            action: KubernetesNodeLifecycleAction::AdmitRemoteCapacity,
+            target_group,
+            correlation_id: (*run_id).to_string(),
+            required_slots: *slots,
+            public_reason: "remote capacity requested by scheduler threshold".to_string(),
+        }),
+        SchedulingDecision::RequestPowerOff {
+            target_group,
+            idle_seconds,
+        } => Some(KubernetesNodeLifecycleEvent {
+            namespace: kubernetes_namespace_for_config(config),
+            service_account: "athernex-orchestrator".to_string(),
+            action: KubernetesNodeLifecycleAction::CordonRemoteCapacity,
+            target_group,
+            correlation_id: format!("idle-remote-capacity-{idle_seconds}"),
+            required_slots: 0,
+            public_reason: format!("remote capacity idle for {idle_seconds} seconds"),
+        }),
+        SchedulingDecision::RunHere { .. }
+        | SchedulingDecision::DispatchRemote { .. }
+        | SchedulingDecision::Hold { .. } => None,
+    }
+}
+
+fn kubernetes_namespace_for_config(config: &OrchestratorConfig) -> String {
+    format!(
+        "{}-scheduler",
+        sanitize_kubernetes_label(&config.control_plane_role)
+    )
+}
+
+fn sanitize_kubernetes_label(value: &str) -> String {
+    let mut label = String::new();
+    let mut previous_dash = false;
+
+    for character in value.chars().flat_map(char::to_lowercase) {
+        let next = if character.is_ascii_lowercase() || character.is_ascii_digit() {
+            Some(character)
+        } else if character == '-' || character == '_' || character == '.' || character == ' ' {
+            Some('-')
+        } else {
+            None
+        };
+
+        if let Some(character) = next {
+            if character == '-' {
+                if !label.is_empty() && !previous_dash {
+                    label.push(character);
+                    previous_dash = true;
+                }
+            } else {
+                label.push(character);
+                previous_dash = false;
+            }
+        }
+    }
+
+    let sanitized = label.trim_matches('-');
+    if sanitized.is_empty() {
+        "control-plane".to_string()
+    } else {
+        sanitized.chars().take(50).collect()
+    }
 }
 
 fn publish_scheduling_observation(
@@ -802,5 +951,99 @@ mod tests {
         assert_eq!(deadletter.workflow_state, WorkflowState::Deadlettered);
         assert_eq!(deadletter.attempt, 1);
         assert!(deadletter.payload.contains("invalid envelope"));
+    }
+
+    #[test]
+    fn power_on_decision_creates_sanitized_kubernetes_admission_handoff() {
+        let decision = SchedulingDecision::RequestPowerOn {
+            run_id: "batch-remote-001",
+            target_group: "worker-group-a",
+            slots: 4,
+        };
+
+        let event = kubernetes_lifecycle_event_for_decision(&decision, &config())
+            .expect("power-on decisions should hand off to the Kubernetes adapter");
+
+        assert_eq!(event.namespace, "local-control-plane-scheduler");
+        assert_eq!(event.service_account, "athernex-orchestrator");
+        assert_eq!(
+            event.action,
+            KubernetesNodeLifecycleAction::AdmitRemoteCapacity
+        );
+        assert_eq!(event.target_group, "worker-group-a");
+        assert_eq!(event.correlation_id, "batch-remote-001");
+        assert_eq!(event.required_slots, 4);
+        assert_public_safe_payload(&event.payload());
+    }
+
+    #[test]
+    fn idle_power_off_decision_creates_cordon_handoff_without_private_node_names() {
+        let decision = SchedulingDecision::RequestPowerOff {
+            target_group: "worker-group-a",
+            idle_seconds: 901,
+        };
+
+        let event = kubernetes_lifecycle_event_for_decision(&decision, &config())
+            .expect("power-off decisions should hand off to the Kubernetes adapter");
+
+        assert_eq!(
+            event.action,
+            KubernetesNodeLifecycleAction::CordonRemoteCapacity
+        );
+        assert_eq!(event.correlation_id, "idle-remote-capacity-901");
+        assert_eq!(event.required_slots, 0);
+        assert!(event.payload().contains("remote capacity idle"));
+        assert_public_safe_payload(&event.payload());
+    }
+
+    #[test]
+    fn local_dispatch_and_hold_decisions_do_not_create_node_lifecycle_handoffs() {
+        let run_here = SchedulingDecision::RunHere {
+            run_id: "interactive-local-001",
+            slots: 1,
+        };
+        let dispatch_remote = SchedulingDecision::DispatchRemote {
+            run_id: "batch-remote-002",
+            slots: 2,
+        };
+        let hold = SchedulingDecision::Hold {
+            run_id: "maintenance-001",
+            reason: "maintenance jobs require an explicit promotion window",
+        };
+
+        assert_eq!(
+            kubernetes_lifecycle_event_for_decision(&run_here, &config()),
+            None
+        );
+        assert_eq!(
+            kubernetes_lifecycle_event_for_decision(&dispatch_remote, &config()),
+            None
+        );
+        assert_eq!(
+            kubernetes_lifecycle_event_for_decision(&hold, &config()),
+            None
+        );
+    }
+
+    #[test]
+    fn kubernetes_namespace_contract_collapses_unsuitable_public_input() {
+        let mut config = config();
+        config.control_plane_role = "Control Plane__Review.Stage!!".to_string();
+
+        assert_eq!(
+            kubernetes_namespace_for_config(&config),
+            "control-plane-review-stage-scheduler"
+        );
+    }
+
+    fn assert_public_safe_payload(payload: &str) {
+        assert!(!payload.contains("ipmi"));
+        assert!(!payload.contains("bmc"));
+        assert!(!payload.contains("rack"));
+        assert!(!payload.contains("192.168."));
+        assert!(!payload.contains("10."));
+        assert!(!payload.contains("172.16."));
+        assert!(!payload.contains("node-"));
+        assert!(!payload.contains("mac="));
     }
 }
