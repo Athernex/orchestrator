@@ -59,10 +59,19 @@ Start Kafka-compatible messaging and LocalStack:
 make local-up
 ```
 
+Kafka UI is exposed at `http://127.0.0.1:18080/` to avoid common local port conflicts.
+
 Run the Rust orchestrator preparation stub:
 
 ```bash
 make run-orchestrator
+```
+
+Run the live Kafka round-trip smoke path against the local broker:
+
+```bash
+ATHERNEX_KAFKA_INTEGRATION=1 cargo test -p orchestrator live_kafka_broker_round_trips_against_local_kafka_when_enabled
+ATHERNEX_LIVE_KAFKA_SMOKE=1 cargo run -p orchestrator
 ```
 
 Run the full local validation suite:
@@ -187,7 +196,7 @@ Use sanitized component names and capability classes instead. See [architecture/
 - [x] Public-safe Kafka producer/consumer contract slice
 - [x] Kubernetes scheduler adapter contracts
 - [x] Kafka adapter facade for typed producer/consumer records
-- [ ] Real Kafka consumer and producer implementation
+- [x] Real Kafka consumer and producer implementation
 - [ ] Paperclip adapter implementation
 - [ ] Load tests for backpressure and retry behavior
 - [ ] Rack-specific deployment manifests kept in a private repo or encrypted vault

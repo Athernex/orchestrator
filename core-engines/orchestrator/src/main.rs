@@ -1,4 +1,13 @@
 use std::env;
+use std::fmt;
+use std::str;
+use std::time::{Duration, Instant};
+
+use rdkafka::config::ClientConfig;
+use rdkafka::consumer::{BaseConsumer, Consumer};
+use rdkafka::error::KafkaError;
+use rdkafka::message::{Header, Headers, Message, OwnedHeaders};
+use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
 
 const DEFAULT_MAX_DELIVERY_ATTEMPTS: u32 = 3;
 
@@ -325,6 +334,145 @@ impl MessageConsumer for KafkaBrokerAdapter {
     }
 }
 
+#[derive(Debug)]
+enum LiveKafkaError {
+    Client(String),
+    Produce(String),
+    Consume(String),
+    Decode(KafkaRecordError),
+    Utf8(String),
+}
+
+impl fmt::Display for LiveKafkaError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LiveKafkaError::Client(error) => write!(formatter, "Kafka client error: {error}"),
+            LiveKafkaError::Produce(error) => write!(formatter, "Kafka produce error: {error}"),
+            LiveKafkaError::Consume(error) => write!(formatter, "Kafka consume error: {error}"),
+            LiveKafkaError::Decode(error) => {
+                write!(formatter, "Kafka record decode error: {error:?}")
+            }
+            LiveKafkaError::Utf8(error) => write!(formatter, "Kafka UTF-8 error: {error}"),
+        }
+    }
+}
+
+struct LiveKafkaBroker {
+    config: KafkaAdapterConfig,
+    producer: BaseProducer,
+    consumer: BaseConsumer,
+}
+
+impl LiveKafkaBroker {
+    fn connect(config: KafkaAdapterConfig) -> Result<Self, LiveKafkaError> {
+        let producer: BaseProducer = ClientConfig::new()
+            .set("bootstrap.servers", &config.bootstrap_servers)
+            .set("client.id", &config.client_id)
+            .set("message.timeout.ms", "5000")
+            .set("queue.buffering.max.ms", "10")
+            .create()
+            .map_err(|error| LiveKafkaError::Client(error.to_string()))?;
+        let consumer: BaseConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &config.bootstrap_servers)
+            .set("client.id", format!("{}-consumer", config.client_id))
+            .set("group.id", &config.consumer_group)
+            .set("enable.auto.commit", "true")
+            .set("auto.offset.reset", "earliest")
+            .set("session.timeout.ms", "6000")
+            .create()
+            .map_err(|error| LiveKafkaError::Client(error.to_string()))?;
+
+        Ok(Self {
+            config,
+            producer,
+            consumer,
+        })
+    }
+
+    fn try_publish(&self, envelope: &MessageEnvelope) -> Result<(), LiveKafkaError> {
+        let record = kafka_record_from_envelope(envelope);
+        self.try_publish_record(&record)
+    }
+
+    fn try_publish_record(&self, record: &KafkaRecord) -> Result<(), LiveKafkaError> {
+        self.producer
+            .send(
+                BaseRecord::to(record.topic.as_str())
+                    .key(record.key.as_str())
+                    .payload(record.payload.as_str())
+                    .headers(owned_headers_from_kafka_record(record)),
+            )
+            .map_err(|(error, _)| LiveKafkaError::Produce(error.to_string()))?;
+        self.producer.poll(Duration::from_millis(0));
+        self.producer
+            .flush(Duration::from_secs(5))
+            .map_err(|error| LiveKafkaError::Produce(error.to_string()))
+    }
+
+    fn try_drain_topic(&self, topic: KafkaTopic) -> Result<Vec<MessageEnvelope>, LiveKafkaError> {
+        self.consumer
+            .subscribe(&[topic.as_str()])
+            .map_err(|error| LiveKafkaError::Consume(error.to_string()))?;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut envelopes = Vec::new();
+
+        while envelopes.len() < self.config.max_poll_records as usize && Instant::now() < deadline {
+            match self.consumer.poll(Duration::from_millis(100)) {
+                Some(Ok(message)) => {
+                    let record = kafka_record_from_message(&message)?;
+                    let envelope =
+                        envelope_from_kafka_record(&record).map_err(LiveKafkaError::Decode)?;
+                    envelopes.push(envelope);
+                }
+                Some(Err(KafkaError::PartitionEOF(_))) | None => {
+                    if !envelopes.is_empty() {
+                        break;
+                    }
+                }
+                Some(Err(error)) => return Err(LiveKafkaError::Consume(error.to_string())),
+            }
+        }
+
+        self.consumer.unsubscribe();
+        Ok(envelopes)
+    }
+}
+
+impl MessageProducer for LiveKafkaBroker {
+    fn publish(&mut self, envelope: MessageEnvelope) {
+        if let Err(error) = self.try_publish(&envelope) {
+            let deadletter =
+                envelope.with_delivery_failure(KafkaTopic::AgentDeadletter, &error.to_string());
+            let _ = self.try_publish(&deadletter);
+        }
+    }
+}
+
+impl MessageConsumer for LiveKafkaBroker {
+    fn drain_topic(&mut self, topic: KafkaTopic) -> Vec<MessageEnvelope> {
+        match self.try_drain_topic(topic) {
+            Ok(envelopes) => envelopes,
+            Err(error) => vec![MessageEnvelope {
+                topic: KafkaTopic::AgentDeadletter,
+                idempotency_key: format!(
+                    "live-kafka-consume-error:{}",
+                    KafkaTopic::AgentDeadletter.as_str()
+                ),
+                correlation_id: "live-kafka-consume-error".to_string(),
+                workflow_state: WorkflowState::Deadlettered,
+                attempt: 1,
+                max_attempts: self.config.max_delivery_attempts,
+                payload: format!(
+                    "live_kafka_consume_failed source_topic={} error={}",
+                    topic.as_str(),
+                    error
+                ),
+            }],
+        }
+    }
+}
+
 fn kafka_record_from_envelope(envelope: &MessageEnvelope) -> KafkaRecord {
     KafkaRecord {
         topic: envelope.topic.as_str().to_string(),
@@ -346,6 +494,56 @@ fn kafka_record_from_envelope(envelope: &MessageEnvelope) -> KafkaRecord {
         ],
         payload: envelope.payload.clone(),
     }
+}
+
+fn owned_headers_from_kafka_record(record: &KafkaRecord) -> OwnedHeaders {
+    let mut headers = OwnedHeaders::new_with_capacity(record.headers.len());
+    for (key, value) in &record.headers {
+        headers = headers.insert(Header {
+            key,
+            value: Some(value.as_str()),
+        });
+    }
+    headers
+}
+
+fn kafka_record_from_message(message: &impl Message) -> Result<KafkaRecord, LiveKafkaError> {
+    let key = message
+        .key()
+        .map(str::from_utf8)
+        .transpose()
+        .map_err(|error| LiveKafkaError::Utf8(error.to_string()))?
+        .unwrap_or_default()
+        .to_string();
+    let payload = message
+        .payload()
+        .map(str::from_utf8)
+        .transpose()
+        .map_err(|error| LiveKafkaError::Utf8(error.to_string()))?
+        .unwrap_or_default()
+        .to_string();
+    let mut headers = Vec::new();
+
+    if let Some(message_headers) = message.headers() {
+        for index in 0..message_headers.count() {
+            let header = message_headers.get(index);
+            let value = header
+                .value
+                .map(str::from_utf8)
+                .transpose()
+                .map_err(|error| LiveKafkaError::Utf8(error.to_string()))?
+                .unwrap_or_default()
+                .to_string();
+            headers.push((header.key.to_string(), value));
+        }
+    }
+
+    Ok(KafkaRecord {
+        topic: message.topic().to_string(),
+        key,
+        headers,
+        payload,
+    })
 }
 
 fn envelope_from_kafka_record(record: &KafkaRecord) -> Result<MessageEnvelope, KafkaRecordError> {
@@ -528,6 +726,9 @@ fn main() {
         "sample_kafka_adapter_contract={:?}",
         sample_kafka_adapter_contract(&config)
     );
+    if let Some(result) = live_kafka_smoke_from_env(&config) {
+        println!("live_kafka_smoke={result}");
+    }
     for decision in sample_scheduling_decisions(&config) {
         println!(
             "sample_scheduling_decision={}",
@@ -583,6 +784,37 @@ fn sample_kafka_contract(config: &OrchestratorConfig) -> Vec<MessageEnvelope> {
     let mut sample = broker.drain_topic(KafkaTopic::PowerCommands);
     sample.extend(broker.drain_topic(KafkaTopic::AgentDeadletter));
     sample
+}
+
+fn live_kafka_smoke_from_env(config: &OrchestratorConfig) -> Option<String> {
+    if env::var("ATHERNEX_LIVE_KAFKA_SMOKE").ok().as_deref() != Some("1") {
+        return None;
+    }
+
+    let adapter_config = KafkaAdapterConfig::from_orchestrator_config(config);
+    let broker = match LiveKafkaBroker::connect(adapter_config) {
+        Ok(broker) => broker,
+        Err(error) => return Some(format!("failed stage=connect error={error}")),
+    };
+    let envelope = MessageEnvelope::new(
+        KafkaTopic::AgentAudit,
+        "live-kafka-smoke",
+        WorkflowState::Scheduled,
+        "live_kafka_smoke source=orchestrator_preparation".to_string(),
+        config,
+    );
+
+    if let Err(error) = broker.try_publish(&envelope) {
+        return Some(format!("failed stage=publish error={error}"));
+    }
+
+    match broker.try_drain_topic(KafkaTopic::AgentAudit) {
+        Ok(envelopes) if envelopes.iter().any(|candidate| candidate == &envelope) => {
+            Some("ok topic=agent.audit".to_string())
+        }
+        Ok(envelopes) => Some(format!("failed stage=consume observed={}", envelopes.len())),
+        Err(error) => Some(format!("failed stage=consume error={error}")),
+    }
 }
 
 fn kafka_adapter_summary(config: &OrchestratorConfig) -> String {
@@ -1347,6 +1579,59 @@ mod tests {
         assert!(deadletters[0].payload.contains("InvalidAttempt"));
         assert!(!deadletters[0].payload.contains("ipmi=private"));
         assert!(!deadletters[0].payload.contains("rack=private"));
+    }
+
+    #[test]
+    fn live_kafka_error_display_names_operation() {
+        assert_eq!(
+            LiveKafkaError::Produce("broker timeout".to_string()).to_string(),
+            "Kafka produce error: broker timeout"
+        );
+        assert_eq!(
+            LiveKafkaError::Decode(KafkaRecordError::InvalidAttempt).to_string(),
+            "Kafka record decode error: InvalidAttempt"
+        );
+    }
+
+    #[test]
+    fn live_kafka_broker_round_trips_against_local_kafka_when_enabled() {
+        if env::var("ATHERNEX_KAFKA_INTEGRATION").ok().as_deref() != Some("1") {
+            return;
+        }
+
+        let mut config = config();
+        let run_id = format!(
+            "live-kafka-smoke-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after UNIX epoch")
+                .as_millis()
+        );
+        config.kafka_bootstrap_servers =
+            env::var("KAFKA_BOOTSTRAP_SERVERS").unwrap_or_else(|_| "127.0.0.1:9092".to_string());
+        config.max_in_flight = 50;
+
+        let mut adapter_config = KafkaAdapterConfig::from_orchestrator_config(&config);
+        adapter_config.consumer_group = format!("{}-group", run_id);
+        let broker = LiveKafkaBroker::connect(adapter_config)
+            .expect("local Kafka broker should accept live client connections");
+        let envelope = MessageEnvelope::new(
+            KafkaTopic::AgentAudit,
+            &run_id,
+            WorkflowState::Scheduled,
+            format!("live_kafka_smoke correlation_id={run_id}"),
+            &config,
+        );
+
+        broker
+            .try_publish(&envelope)
+            .expect("live Kafka publish should succeed");
+
+        let drained = broker
+            .try_drain_topic(KafkaTopic::AgentAudit)
+            .expect("live Kafka consume should succeed");
+
+        assert!(drained.iter().any(|candidate| candidate == &envelope));
     }
 
     #[test]
