@@ -9,6 +9,7 @@ use rdkafka::consumer::{BaseConsumer, Consumer};
 use rdkafka::error::KafkaError;
 use rdkafka::message::{Header, Headers, Message, OwnedHeaders};
 use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
+use sha2::{Digest, Sha256};
 
 const DEFAULT_MAX_DELIVERY_ATTEMPTS: u32 = 3;
 
@@ -139,6 +140,7 @@ impl MessageEnvelope {
     }
 
     fn with_delivery_failure(&self, topic: KafkaTopic, reason: &str) -> Self {
+        let payload_hash = Sha256::digest(self.payload.as_bytes());
         Self {
             topic,
             idempotency_key: format!("{}:{}", self.correlation_id, topic.as_str()),
@@ -147,10 +149,9 @@ impl MessageEnvelope {
             attempt: self.attempt,
             max_attempts: self.max_attempts,
             payload: format!(
-                "delivery_failed source_topic={} reason={} payload={}",
+                "delivery_failed source_topic={} reason={} payload_sha256={payload_hash:x}",
                 self.topic.as_str(),
-                reason,
-                self.payload
+                reason
             ),
         }
     }
@@ -650,6 +651,7 @@ enum ReservationError {
     InsufficientCapacity { requested: u32, available: u32 },
     ConflictingReservation,
     StaleFencingToken,
+    FencingTokenExhausted,
 }
 
 /// Deterministic admission ledger used before a scheduling decision is
@@ -682,11 +684,10 @@ impl CapacityLedger {
             return Err(ReservationError::InvalidRequest);
         }
         self.expire(now_epoch_ms);
-        if let Some(existing) = self.leases.get_mut(run_id) {
+        if let Some(existing) = self.leases.get(run_id) {
             if existing.slots != slots {
                 return Err(ReservationError::ConflictingReservation);
             }
-            existing.expires_at_epoch_ms = now_epoch_ms.saturating_add(lease_duration_ms);
             return Ok(existing.clone());
         }
         let available = self.available_slots();
@@ -696,13 +697,17 @@ impl CapacityLedger {
                 available,
             });
         }
+        let next_token = self
+            .next_fencing_token
+            .checked_add(1)
+            .ok_or(ReservationError::FencingTokenExhausted)?;
         let lease = CapacityLease {
             run_id: run_id.to_string(),
             slots,
             fencing_token: self.next_fencing_token,
             expires_at_epoch_ms: now_epoch_ms.saturating_add(lease_duration_ms),
         };
-        self.next_fencing_token = self.next_fencing_token.saturating_add(1);
+        self.next_fencing_token = next_token;
         self.leases.insert(run_id.to_string(), lease.clone());
         Ok(lease)
     }
@@ -825,15 +830,31 @@ fn main() {
     println!("max_in_flight={}", config.max_in_flight);
     println!("retry_limit={}", config.retry_limit);
     let mut capacity_ledger = CapacityLedger::new(config.local_capacity_slots);
-    if let Ok(lease) = capacity_ledger.reserve("startup-probe", 1, 0, 1_000) {
-        println!(
-            "capacity_admission=reserved run_id={} slots={} fencing_token={} available_slots={}",
-            lease.run_id,
-            lease.slots,
-            lease.fencing_token,
-            capacity_ledger.available_slots()
-        );
-        let _ = capacity_ledger.release(&lease.run_id, lease.fencing_token);
+    let mut admission_broker = InMemoryBroker::default();
+    let admission = publish_scheduling_observation(
+        &mut admission_broker,
+        &mut capacity_ledger,
+        &JobRequest {
+            run_id: "startup-probe",
+            required_slots: 1,
+            priority: JobPriority::Interactive,
+            allows_remote_capacity: false,
+        },
+        &CapacitySnapshot {
+            local_available_slots: config.local_capacity_slots,
+            remote_online_slots: 0,
+            remote_powering_slots: 0,
+            idle_seconds: 0,
+        },
+        &config,
+        0,
+        1_000,
+    );
+    println!("sample_capacity_admission={admission:?}");
+    if let Some(lease) = capacity_ledger.leases.get("startup-probe").cloned() {
+        if let Err(error) = capacity_ledger.release(&lease.run_id, lease.fencing_token) {
+            eprintln!("sample_capacity_release_failed={error:?}");
+        }
     }
     println!("workflow_states={:?}", workflow_states());
     println!("kafka_topics={:?}", kafka_topics());
@@ -875,8 +896,10 @@ fn main() {
 
 fn sample_kafka_contract(config: &OrchestratorConfig) -> Vec<MessageEnvelope> {
     let mut broker = InMemoryBroker::default();
+    let mut ledger = CapacityLedger::new(config.local_capacity_slots);
     let power_command = publish_scheduling_observation(
         &mut broker,
+        &mut ledger,
         &JobRequest {
             run_id: "batch-remote-001",
             required_slots: 4,
@@ -890,6 +913,8 @@ fn sample_kafka_contract(config: &OrchestratorConfig) -> Vec<MessageEnvelope> {
             idle_seconds: 0,
         },
         config,
+        0,
+        1_000,
     );
     let mut exhausted_command = power_command.clone();
     exhausted_command.attempt = exhausted_command.max_attempts;
@@ -1175,13 +1200,53 @@ fn sanitize_kubernetes_label(value: &str) -> String {
 
 fn publish_scheduling_observation(
     producer: &mut impl MessageProducer,
+    ledger: &mut CapacityLedger,
     job: &JobRequest,
     capacity: &CapacitySnapshot,
     config: &OrchestratorConfig,
+    now_epoch_ms: u64,
+    lease_duration_ms: u64,
 ) -> MessageEnvelope {
     let decision = decide_capacity_action(job, capacity, config);
-    let envelope = envelope_for_decision(job.run_id, &decision, config);
-
+    let mut envelope = match &decision {
+        SchedulingDecision::RunHere { slots, .. } => {
+            match ledger.reserve(job.run_id, *slots, now_epoch_ms, lease_duration_ms) {
+                Ok(lease) => {
+                    let mut envelope = envelope_for_decision(job.run_id, &decision, config);
+                    envelope.payload.push_str(&format!(
+                        " fencing_token={} lease_expires_at_epoch_ms={}",
+                        lease.fencing_token, lease.expires_at_epoch_ms
+                    ));
+                    envelope
+                }
+                Err(error) => MessageEnvelope::new(
+                    KafkaTopic::SchedulerCapacity,
+                    job.run_id,
+                    WorkflowState::Scheduled,
+                    format!(
+                        "hold run_id={} reason=capacity_admission_failed error={error:?}",
+                        job.run_id
+                    ),
+                    config,
+                ),
+            }
+        }
+        _ => envelope_for_decision(job.run_id, &decision, config),
+    };
+    // Explicitly tie the idempotency key to a lease generation. A replay of
+    // the same reservation keeps its token; a new generation gets a new key.
+    if let Some(lease) = ledger.leases.get(job.run_id) {
+        if envelope.topic == KafkaTopic::AgentCommands
+            && matches!(decision, SchedulingDecision::RunHere { .. })
+        {
+            envelope.idempotency_key = format!(
+                "{}:{}:{}",
+                job.run_id,
+                envelope.topic.as_str(),
+                lease.fencing_token
+            );
+        }
+    }
     producer.publish(envelope.clone());
     envelope
 }
@@ -1430,7 +1495,7 @@ mod tests {
         let first = ledger.reserve("run-1", 3, 100, 1_000).unwrap();
         let replay = ledger.reserve("run-1", 3, 200, 1_000).unwrap();
         assert_eq!(first.fencing_token, replay.fencing_token);
-        assert_eq!(replay.expires_at_epoch_ms, 1_200);
+        assert_eq!(replay.expires_at_epoch_ms, 1_100);
         assert_eq!(ledger.available_slots(), 1);
         assert_eq!(
             ledger.reserve("run-2", 2, 200, 1_000),
@@ -1464,6 +1529,75 @@ mod tests {
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].run_id, "abandoned");
         assert_eq!(ledger.available_slots(), 2);
+    }
+
+    #[test]
+    fn exhausted_fencing_token_cannot_be_reused() {
+        let mut ledger = CapacityLedger::new(2);
+        ledger.next_fencing_token = u64::MAX;
+        assert_eq!(
+            ledger.reserve("run", 1, 0, 1_000),
+            Err(ReservationError::FencingTokenExhausted)
+        );
+        assert_eq!(ledger.available_slots(), 2);
+    }
+
+    #[test]
+    fn admitted_publication_holds_second_job_and_fences_replays() {
+        let config = config();
+        let capacity = CapacitySnapshot {
+            local_available_slots: 2,
+            remote_online_slots: 0,
+            remote_powering_slots: 0,
+            idle_seconds: 0,
+        };
+        let mut ledger = CapacityLedger::new(2);
+        let mut broker = InMemoryBroker::default();
+        let first_job = JobRequest {
+            run_id: "first",
+            required_slots: 2,
+            priority: JobPriority::Interactive,
+            allows_remote_capacity: false,
+        };
+        let first = publish_scheduling_observation(
+            &mut broker,
+            &mut ledger,
+            &first_job,
+            &capacity,
+            &config,
+            100,
+            1_000,
+        );
+        let replay = publish_scheduling_observation(
+            &mut broker,
+            &mut ledger,
+            &first_job,
+            &capacity,
+            &config,
+            200,
+            1_000,
+        );
+        assert_eq!(first.idempotency_key, replay.idempotency_key);
+        assert_eq!(first.payload, replay.payload);
+        assert!(first.payload.contains("fencing_token=1"));
+        let second = publish_scheduling_observation(
+            &mut broker,
+            &mut ledger,
+            &JobRequest {
+                run_id: "second",
+                required_slots: 1,
+                priority: JobPriority::Interactive,
+                allows_remote_capacity: false,
+            },
+            &capacity,
+            &config,
+            200,
+            1_000,
+        );
+        assert_eq!(second.topic, KafkaTopic::SchedulerCapacity);
+        assert!(second.payload.contains("capacity_admission_failed"));
+        assert_eq!(broker.drain_topic(KafkaTopic::AgentCommands).len(), 2);
+        assert_eq!(broker.drain_topic(KafkaTopic::SchedulerCapacity).len(), 1);
     }
 
     #[test]
@@ -1587,8 +1721,10 @@ mod tests {
     #[test]
     fn power_on_decisions_publish_to_power_commands() {
         let mut broker = InMemoryBroker::default();
+        let mut ledger = CapacityLedger::new(2);
         let envelope = publish_scheduling_observation(
             &mut broker,
+            &mut ledger,
             &JobRequest {
                 run_id: "batch-remote-001",
                 required_slots: 4,
@@ -1602,6 +1738,8 @@ mod tests {
                 idle_seconds: 0,
             },
             &config(),
+            0,
+            1_000,
         );
 
         let power_commands = broker.drain_topic(KafkaTopic::PowerCommands);
@@ -1616,8 +1754,10 @@ mod tests {
     #[test]
     fn hold_decisions_publish_to_scheduler_capacity() {
         let mut broker = InMemoryBroker::default();
+        let mut ledger = CapacityLedger::new(2);
         let envelope = publish_scheduling_observation(
             &mut broker,
+            &mut ledger,
             &JobRequest {
                 run_id: "small-remote-001",
                 required_slots: 2,
@@ -1631,6 +1771,8 @@ mod tests {
                 idle_seconds: 0,
             },
             &config(),
+            0,
+            1_000,
         );
 
         assert_eq!(envelope.topic, KafkaTopic::SchedulerCapacity);
@@ -1697,6 +1839,8 @@ mod tests {
         assert_eq!(deadletter.workflow_state, WorkflowState::Deadlettered);
         assert_eq!(deadletter.attempt, 1);
         assert!(deadletter.payload.contains("invalid envelope"));
+        assert!(!deadletter.payload.contains("hold run_id=maintenance-001"));
+        assert!(deadletter.payload.contains("payload_sha256="));
     }
 
     #[test]
@@ -1748,9 +1892,11 @@ mod tests {
     fn kafka_broker_adapter_implements_existing_message_traits() {
         let mut adapter =
             KafkaBrokerAdapter::new(KafkaAdapterConfig::from_orchestrator_config(&config()));
+        let mut ledger = CapacityLedger::new(2);
 
         let envelope = publish_scheduling_observation(
             &mut adapter,
+            &mut ledger,
             &JobRequest {
                 run_id: "batch-remote-001",
                 required_slots: 4,
@@ -1764,6 +1910,8 @@ mod tests {
                 idle_seconds: 0,
             },
             &config(),
+            0,
+            1_000,
         );
 
         let drained = adapter.drain_topic(KafkaTopic::PowerCommands);

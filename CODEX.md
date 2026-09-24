@@ -33,6 +33,13 @@ This file is the MRGI working ledger for detachable Codex repo-improvement loops
 
 ## Completed Log
 
+- 2026-09-24: Added lease-backed local capacity admission to the staging
+  publication path. Local commands include a fencing token and lease expiry;
+  admission emits a hold when no slots remain; replay keeps the token while a
+  new generation gets a new token. Dead letters now retain a SHA-256 payload
+  fingerprint without copying the command body. Verified with Rust tests,
+  Clippy, `make check`, and live Kafka round trips. The next Paperclip adapter
+  task remains open.
 - 2026-07-24: Completed bounded Kafka load tests for backpressure and retry behavior. Added max-poll enforcement to the staged Kafka adapter, a deterministic load report covering retry and dead-letter classification, unit tests for bounded staged drains, an opt-in live Kafka load smoke against local Kafka, and README validation commands. Verified with `make check` and `ATHERNEX_KAFKA_INTEGRATION=1 cargo test -p orchestrator live_kafka_load_smoke_bounds_polling_when_enabled -- --nocapture`; optional `cargo-audit` and OpenTofu checks were skipped because the tools are not installed.
 - 2026-07-24: Completed the live Kafka client implementation behind the adapter facade. Added an `rdkafka` live broker with fallible publish/drain methods, header-preserving record conversion, explicit UTF-8/decode errors, opt-in live smoke validation, and an environment-gated Kafka integration test. Updated local compose from unavailable `bitnami/kafka:3.7` to official `apache/kafka:3.7.1`, moved Kafka UI to `127.0.0.1:18080`, and verified real publish/consume against local Kafka. Verified with `make check`, `make local-up`, `ATHERNEX_KAFKA_INTEGRATION=1 cargo test -p orchestrator live_kafka_broker_round_trips_against_local_kafka_when_enabled -- --nocapture`, and `ATHERNEX_LIVE_KAFKA_SMOKE=1 cargo run -p orchestrator`; optional `cargo-audit` and OpenTofu checks were skipped because the tools are not installed.
 - 2026-07-24: Completed the real Kafka producer/consumer adapter skeleton behind the existing broker traits. Added sanitized adapter configuration, typed Kafka record headers, envelope round-tripping, a staged `KafkaBrokerAdapter`, malformed-record dead-letter routing that avoids payload echo, sample orchestrator output, and 4 focused tests. Verified with `make check`; optional `cargo-audit` and OpenTofu checks were skipped because the tools are not installed.

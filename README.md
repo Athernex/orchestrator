@@ -202,6 +202,10 @@ make local-down
 6. **Rust orchestration:** typed workflow states, retry policies, idempotency keys,
    and a lease-based capacity admission ledger with bounded expiry and fencing
    tokens to prevent overcommit or stale-worker release before any rack-wide scheduling.
+   The staging publication path includes the lease token and expiry in local
+   command envelopes and emits a hold when admission has no free slots.
+   Delivery dead letters retain a SHA-256 payload fingerprint for correlation
+   without copying the original command body into the dead-letter topic.
 7. **Paperclip adapter:** public-safe request/response envelopes, with secrets and private prompt material kept out of git.
 8. **Failure, security, and hallucination controls:** deterministic validation, evidence capture, review queues, quarantine states, and staged promotion.
 9. **Scheduled public improvements:** official Paperclip can manage agents and routines; the local Codex scheduler bridge can run Codex in non-interactive bypass mode, verify with `make check`, and optionally commit/push public-safe changes.
