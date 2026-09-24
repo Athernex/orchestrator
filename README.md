@@ -199,7 +199,9 @@ make local-down
 3. **Brokered power scheduling:** Kafka topics for capacity decisions, power commands, power observations, state capture, dead letters, and audit trails.
 4. **Workload scheduling:** Kubernetes-facing contracts for dynamic capacity and node lifecycle orchestration, with private power and cluster procedures kept outside git.
 5. **Local AWS staging:** S3 for artifacts, DynamoDB for run metadata, SQS for fallback queues and dead-letter inspection.
-6. **Rust orchestration:** typed workflow states, retry policies, idempotency keys, and conservative rate limits before any rack-wide scheduling.
+6. **Rust orchestration:** typed workflow states, retry policies, idempotency keys,
+   and a lease-based capacity admission ledger with bounded expiry and fencing
+   tokens to prevent overcommit or stale-worker release before any rack-wide scheduling.
 7. **Paperclip adapter:** public-safe request/response envelopes, with secrets and private prompt material kept out of git.
 8. **Failure, security, and hallucination controls:** deterministic validation, evidence capture, review queues, quarantine states, and staged promotion.
 9. **Scheduled public improvements:** official Paperclip can manage agents and routines; the local Codex scheduler bridge can run Codex in non-interactive bypass mode, verify with `make check`, and optionally commit/push public-safe changes.

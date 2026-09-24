@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
 use std::str;
@@ -635,6 +636,107 @@ struct CapacitySnapshot {
     idle_seconds: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CapacityLease {
+    run_id: String,
+    slots: u32,
+    fencing_token: u64,
+    expires_at_epoch_ms: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReservationError {
+    InvalidRequest,
+    InsufficientCapacity { requested: u32, available: u32 },
+    ConflictingReservation,
+    StaleFencingToken,
+}
+
+/// Deterministic admission ledger used before a scheduling decision is
+/// published. Leases bound abandoned capacity and monotonically increasing
+/// fencing tokens prevent a delayed worker from releasing a newer lease.
+#[derive(Debug)]
+struct CapacityLedger {
+    total_slots: u32,
+    next_fencing_token: u64,
+    leases: BTreeMap<String, CapacityLease>,
+}
+
+impl CapacityLedger {
+    fn new(total_slots: u32) -> Self {
+        Self {
+            total_slots,
+            next_fencing_token: 1,
+            leases: BTreeMap::new(),
+        }
+    }
+
+    fn reserve(
+        &mut self,
+        run_id: &str,
+        slots: u32,
+        now_epoch_ms: u64,
+        lease_duration_ms: u64,
+    ) -> Result<CapacityLease, ReservationError> {
+        if run_id.trim().is_empty() || slots == 0 || lease_duration_ms == 0 {
+            return Err(ReservationError::InvalidRequest);
+        }
+        self.expire(now_epoch_ms);
+        if let Some(existing) = self.leases.get_mut(run_id) {
+            if existing.slots != slots {
+                return Err(ReservationError::ConflictingReservation);
+            }
+            existing.expires_at_epoch_ms = now_epoch_ms.saturating_add(lease_duration_ms);
+            return Ok(existing.clone());
+        }
+        let available = self.available_slots();
+        if slots > available {
+            return Err(ReservationError::InsufficientCapacity {
+                requested: slots,
+                available,
+            });
+        }
+        let lease = CapacityLease {
+            run_id: run_id.to_string(),
+            slots,
+            fencing_token: self.next_fencing_token,
+            expires_at_epoch_ms: now_epoch_ms.saturating_add(lease_duration_ms),
+        };
+        self.next_fencing_token = self.next_fencing_token.saturating_add(1);
+        self.leases.insert(run_id.to_string(), lease.clone());
+        Ok(lease)
+    }
+
+    fn release(&mut self, run_id: &str, fencing_token: u64) -> Result<(), ReservationError> {
+        match self.leases.get(run_id) {
+            Some(lease) if lease.fencing_token == fencing_token => {
+                self.leases.remove(run_id);
+                Ok(())
+            }
+            Some(_) => Err(ReservationError::StaleFencingToken),
+            None => Ok(()),
+        }
+    }
+
+    fn expire(&mut self, now_epoch_ms: u64) -> Vec<CapacityLease> {
+        let expired_ids = self
+            .leases
+            .iter()
+            .filter(|(_, lease)| lease.expires_at_epoch_ms <= now_epoch_ms)
+            .map(|(run_id, _)| run_id.clone())
+            .collect::<Vec<_>>();
+        expired_ids
+            .into_iter()
+            .filter_map(|run_id| self.leases.remove(&run_id))
+            .collect()
+    }
+
+    fn available_slots(&self) -> u32 {
+        let reserved = self.leases.values().map(|lease| lease.slots).sum::<u32>();
+        self.total_slots.saturating_sub(reserved)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum SchedulingDecision {
     RunHere {
@@ -722,6 +824,17 @@ fn main() {
     println!("paperclip_endpoint={}", config.paperclip_endpoint);
     println!("max_in_flight={}", config.max_in_flight);
     println!("retry_limit={}", config.retry_limit);
+    let mut capacity_ledger = CapacityLedger::new(config.local_capacity_slots);
+    if let Ok(lease) = capacity_ledger.reserve("startup-probe", 1, 0, 1_000) {
+        println!(
+            "capacity_admission=reserved run_id={} slots={} fencing_token={} available_slots={}",
+            lease.run_id,
+            lease.slots,
+            lease.fencing_token,
+            capacity_ledger.available_slots()
+        );
+        let _ = capacity_ledger.release(&lease.run_id, lease.fencing_token);
+    }
     println!("workflow_states={:?}", workflow_states());
     println!("kafka_topics={:?}", kafka_topics());
     println!("sample_kafka_contract={:?}", sample_kafka_contract(&config));
@@ -1309,6 +1422,48 @@ mod tests {
             max_in_flight: 8,
             retry_limit: 3,
         }
+    }
+
+    #[test]
+    fn capacity_ledger_prevents_overcommit_and_is_idempotent() {
+        let mut ledger = CapacityLedger::new(4);
+        let first = ledger.reserve("run-1", 3, 100, 1_000).unwrap();
+        let replay = ledger.reserve("run-1", 3, 200, 1_000).unwrap();
+        assert_eq!(first.fencing_token, replay.fencing_token);
+        assert_eq!(replay.expires_at_epoch_ms, 1_200);
+        assert_eq!(ledger.available_slots(), 1);
+        assert_eq!(
+            ledger.reserve("run-2", 2, 200, 1_000),
+            Err(ReservationError::InsufficientCapacity {
+                requested: 2,
+                available: 1
+            })
+        );
+    }
+
+    #[test]
+    fn expired_lease_gets_new_fencing_token_and_rejects_stale_release() {
+        let mut ledger = CapacityLedger::new(2);
+        let old = ledger.reserve("run-1", 2, 100, 100).unwrap();
+        let replacement = ledger.reserve("run-1", 2, 201, 100).unwrap();
+        assert!(replacement.fencing_token > old.fencing_token);
+        assert_eq!(
+            ledger.release("run-1", old.fencing_token),
+            Err(ReservationError::StaleFencingToken)
+        );
+        ledger.release("run-1", replacement.fencing_token).unwrap();
+        assert_eq!(ledger.available_slots(), 2);
+    }
+
+    #[test]
+    fn expiration_reclaims_abandoned_capacity_at_boundary() {
+        let mut ledger = CapacityLedger::new(2);
+        ledger.reserve("abandoned", 2, 1_000, 500).unwrap();
+        assert_eq!(ledger.available_slots(), 0);
+        let expired = ledger.expire(1_500);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].run_id, "abandoned");
+        assert_eq!(ledger.available_slots(), 2);
     }
 
     #[test]
