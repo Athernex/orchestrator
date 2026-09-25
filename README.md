@@ -66,6 +66,9 @@ publishing local execution commands; Kafka publication itself is not an atomic
 transaction with the SQLite commit. The typed Paperclip review adapter is a
 public-safe contract and fixture, not a connection to a private Paperclip
 server. It requires explicit approval before any future remote action path.
+The `durable_failure_scenario_holds_unreviewed_work_and_replays_after_restart`
+test joins the scheduler decision, durable ledger, broker interruption, review
+timeout, restart, expiry, and stale release in one deterministic scenario.
 
 Requirements:
 

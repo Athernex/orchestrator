@@ -1533,6 +1533,77 @@ fn read_u32_env(key: &str, default: u32) -> u32 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn durable_failure_scenario_holds_unreviewed_work_and_replays_after_restart() {
+        use durable_capacity::{Decision, DurableCapacity};
+        use orchestrator::paperclip::{
+            review, AdapterError, ReviewRequest, ReviewTransport, SCHEMA,
+        };
+        struct Timeout;
+        impl ReviewTransport for Timeout {
+            fn exchange(&mut self, _: &[u8], _: Duration) -> Result<Vec<u8>, AdapterError> {
+                Err(AdapterError::Timeout)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capacity.db");
+        let mut first = DurableCapacity::open(&path).unwrap();
+        assert!(first.configure("local", 1).unwrap());
+        let job = JobRequest {
+            run_id: "job-1",
+            required_slots: 1,
+            priority: JobPriority::Interactive,
+            allows_remote_capacity: false,
+        };
+        let capacity = CapacitySnapshot {
+            local_available_slots: 1,
+            remote_online_slots: 0,
+            remote_powering_slots: 0,
+            idle_seconds: 0,
+        };
+        assert!(matches!(
+            decide_capacity_action(&job, &capacity, &config()),
+            SchedulingDecision::RunHere { .. }
+        ));
+        let Decision::Granted(lease) = first.reserve("job-1", "local", 1, 100, 1000).unwrap()
+        else {
+            panic!()
+        };
+        // Broker interruption before publication: the reservation remains authoritative.
+        drop(first);
+        let mut restarted = DurableCapacity::open(&path).unwrap();
+        assert_eq!(
+            restarted.reserve("job-1", "local", 1, 200, 1000).unwrap(),
+            Decision::Duplicate(lease.clone())
+        );
+        assert_eq!(
+            restarted.reserve("job-2", "local", 1, 200, 1000).unwrap(),
+            Decision::Refused("insufficient_capacity")
+        );
+        let request = ReviewRequest {
+            schema_version: SCHEMA.into(),
+            correlation_id: "job-1".into(),
+            idempotency_key: format!("job-1-{}", lease.generation),
+            action_class: "schedule".into(),
+            resource_class: "compute".into(),
+        };
+        let mut broker = InMemoryBroker::default();
+        assert_eq!(review(&mut Timeout, &request), Err(AdapterError::Timeout));
+        assert!(broker.drain_topic(KafkaTopic::AgentCommands).is_empty());
+        let replacement = restarted.reserve("job-1", "local", 1, 1101, 1000).unwrap();
+        let Decision::Granted(new_lease) = replacement else {
+            panic!()
+        };
+        assert!(new_lease.generation > lease.generation);
+        assert_eq!(
+            restarted
+                .release("job-1", "local", lease.generation, 1102)
+                .unwrap(),
+            "stale_generation"
+        );
+        assert_eq!(restarted.active("local", 1102).unwrap().len(), 1);
+    }
+
     fn config() -> OrchestratorConfig {
         OrchestratorConfig {
             project_name: "Project Athernex".to_string(),
