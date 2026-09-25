@@ -60,9 +60,10 @@ cargo run -p orchestrator -- capacity target/capacity.sqlite3 local 2 reserve jo
 cargo run -p orchestrator -- capacity target/capacity.sqlite3 local 2 status
 ```
 
-The existing no-argument scheduler demonstration still uses its in-memory
-fixture. Deployments must invoke the durable admission interface before
-publishing local execution commands; Kafka publication itself is not an atomic
+The no-argument scheduler demonstration uses its in-memory fixture by default;
+set `ATHERNEX_CAPACITY_DB` to run that same publication path through the
+durable ledger. The `capacity` CLI uses the durable ledger directly. Kafka
+publication itself is not an atomic
 transaction with the SQLite commit. The typed Paperclip review adapter is a
 public-safe contract and fixture, not a connection to a private Paperclip
 server. It requires explicit approval before any future remote action path.

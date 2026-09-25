@@ -653,6 +653,22 @@ enum ReservationError {
     ConflictingReservation,
     StaleFencingToken,
     FencingTokenExhausted,
+    DurableRefusal(&'static str),
+    StorageUnavailable,
+}
+
+impl ReservationError {
+    fn reason_code(&self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::InsufficientCapacity { .. } => "insufficient_capacity",
+            Self::ConflictingReservation => "conflicting_reservation",
+            Self::StaleFencingToken => "stale_fencing_token",
+            Self::FencingTokenExhausted => "fencing_token_exhausted",
+            Self::DurableRefusal(reason) => reason,
+            Self::StorageUnavailable => "storage_unavailable",
+        }
+    }
 }
 
 /// Deterministic admission ledger used before a scheduling decision is
@@ -740,6 +756,62 @@ impl CapacityLedger {
     fn available_slots(&self) -> u32 {
         let reserved = self.leases.values().map(|lease| lease.slots).sum::<u32>();
         self.total_slots.saturating_sub(reserved)
+    }
+}
+
+trait CapacityAdmission {
+    fn reserve(
+        &mut self,
+        run_id: &str,
+        slots: u32,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<CapacityLease, ReservationError>;
+}
+
+impl CapacityAdmission for CapacityLedger {
+    fn reserve(
+        &mut self,
+        run_id: &str,
+        slots: u32,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<CapacityLease, ReservationError> {
+        CapacityLedger::reserve(self, run_id, slots, now_ms, ttl_ms)
+    }
+}
+
+struct DurableAdmission {
+    ledger: durable_capacity::DurableCapacity,
+    resource: String,
+}
+
+impl CapacityAdmission for DurableAdmission {
+    fn reserve(
+        &mut self,
+        run_id: &str,
+        slots: u32,
+        now_ms: u64,
+        ttl_ms: u64,
+    ) -> Result<CapacityLease, ReservationError> {
+        use durable_capacity::Decision;
+        let now = i64::try_from(now_ms).map_err(|_| ReservationError::InvalidRequest)?;
+        let ttl = i64::try_from(ttl_ms).map_err(|_| ReservationError::InvalidRequest)?;
+        let decision = self
+            .ledger
+            .reserve(run_id, &self.resource, slots, now, ttl)
+            .map_err(|_| ReservationError::StorageUnavailable)?;
+        match decision {
+            Decision::Granted(lease) | Decision::Duplicate(lease) => Ok(CapacityLease {
+                run_id: lease.owner,
+                slots: lease.slots,
+                fencing_token: u64::try_from(lease.generation)
+                    .map_err(|_| ReservationError::StorageUnavailable)?,
+                expires_at_epoch_ms: u64::try_from(lease.expires_ms)
+                    .map_err(|_| ReservationError::StorageUnavailable)?,
+            }),
+            Decision::Refused(reason) => Err(ReservationError::DurableRefusal(reason)),
+        }
     }
 }
 
@@ -838,10 +910,29 @@ fn main() {
     println!("max_in_flight={}", config.max_in_flight);
     println!("retry_limit={}", config.retry_limit);
     let mut capacity_ledger = CapacityLedger::new(config.local_capacity_slots);
+    let mut durable_admission = env::var("ATHERNEX_CAPACITY_DB").ok().map(|path| {
+        let mut ledger = durable_capacity::DurableCapacity::open(std::path::Path::new(&path))
+            .unwrap_or_else(|_| {
+                eprintln!("capacity ledger unavailable");
+                std::process::exit(2)
+            });
+        if ledger.configure("local", config.local_capacity_slots).ok() != Some(true) {
+            eprintln!("capacity ledger configuration rejected");
+            std::process::exit(2);
+        }
+        DurableAdmission {
+            ledger,
+            resource: "local".into(),
+        }
+    });
+    let admission_ledger: &mut dyn CapacityAdmission = match durable_admission.as_mut() {
+        Some(ledger) => ledger,
+        None => &mut capacity_ledger,
+    };
     let mut admission_broker = InMemoryBroker::default();
     let admission = publish_scheduling_observation(
         &mut admission_broker,
-        &mut capacity_ledger,
+        admission_ledger,
         &JobRequest {
             run_id: "startup-probe",
             required_slots: 1,
@@ -1260,7 +1351,7 @@ fn sanitize_kubernetes_label(value: &str) -> String {
 
 fn publish_scheduling_observation(
     producer: &mut impl MessageProducer,
-    ledger: &mut CapacityLedger,
+    ledger: &mut dyn CapacityAdmission,
     job: &JobRequest,
     capacity: &CapacitySnapshot,
     config: &OrchestratorConfig,
@@ -1268,10 +1359,12 @@ fn publish_scheduling_observation(
     lease_duration_ms: u64,
 ) -> MessageEnvelope {
     let decision = decide_capacity_action(job, capacity, config);
+    let mut admitted_lease = None;
     let mut envelope = match &decision {
         SchedulingDecision::RunHere { slots, .. } => {
             match ledger.reserve(job.run_id, *slots, now_epoch_ms, lease_duration_ms) {
                 Ok(lease) => {
+                    admitted_lease = Some(lease.clone());
                     let mut envelope = envelope_for_decision(job.run_id, &decision, config);
                     envelope.payload.push_str(&format!(
                         " fencing_token={} lease_expires_at_epoch_ms={}",
@@ -1284,8 +1377,9 @@ fn publish_scheduling_observation(
                     job.run_id,
                     WorkflowState::Scheduled,
                     format!(
-                        "hold run_id={} reason=capacity_admission_failed error={error:?}",
-                        job.run_id
+                        "hold run_id={} reason=capacity_admission_failed detail={}",
+                        job.run_id,
+                        error.reason_code()
                     ),
                     config,
                 ),
@@ -1295,7 +1389,7 @@ fn publish_scheduling_observation(
     };
     // Explicitly tie the idempotency key to a lease generation. A replay of
     // the same reservation keeps its token; a new generation gets a new key.
-    if let Some(lease) = ledger.leases.get(job.run_id) {
+    if let Some(lease) = admitted_lease {
         if envelope.topic == KafkaTopic::AgentCommands
             && matches!(decision, SchedulingDecision::RunHere { .. })
         {
@@ -1602,6 +1696,72 @@ mod tests {
             "stale_generation"
         );
         assert_eq!(restarted.active("local", 1102).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn scheduler_publication_uses_durable_admission_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admission.sqlite3");
+        let mut ledger = durable_capacity::DurableCapacity::open(&path).unwrap();
+        assert!(ledger.configure("local", 1).unwrap());
+        let mut admission = DurableAdmission {
+            ledger,
+            resource: "local".into(),
+        };
+        let job = JobRequest {
+            run_id: "job-1",
+            required_slots: 1,
+            priority: JobPriority::Interactive,
+            allows_remote_capacity: false,
+        };
+        let capacity = CapacitySnapshot {
+            local_available_slots: 1,
+            remote_online_slots: 0,
+            remote_powering_slots: 0,
+            idle_seconds: 0,
+        };
+        let mut broker = InMemoryBroker::default();
+        let first = publish_scheduling_observation(
+            &mut broker,
+            &mut admission,
+            &job,
+            &capacity,
+            &config(),
+            100,
+            1000,
+        );
+        assert_eq!(first.topic, KafkaTopic::AgentCommands);
+        drop(admission);
+        let mut admission = DurableAdmission {
+            ledger: durable_capacity::DurableCapacity::open(&path).unwrap(),
+            resource: "local".into(),
+        };
+        let replay = publish_scheduling_observation(
+            &mut broker,
+            &mut admission,
+            &job,
+            &capacity,
+            &config(),
+            200,
+            1000,
+        );
+        assert_eq!(first.idempotency_key, replay.idempotency_key);
+        let second = publish_scheduling_observation(
+            &mut broker,
+            &mut admission,
+            &JobRequest {
+                run_id: "job-2",
+                required_slots: 1,
+                priority: JobPriority::Interactive,
+                allows_remote_capacity: false,
+            },
+            &capacity,
+            &config(),
+            200,
+            1000,
+        );
+        assert_eq!(second.topic, KafkaTopic::SchedulerCapacity);
+        assert!(second.payload.contains("insufficient_capacity"));
     }
 
     fn config() -> OrchestratorConfig {
