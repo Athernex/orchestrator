@@ -10,6 +10,7 @@ use rdkafka::error::KafkaError;
 use rdkafka::message::{Header, Headers, Message, OwnedHeaders};
 use rdkafka::producer::{BaseProducer, BaseRecord, Producer};
 use sha2::{Digest, Sha256};
+mod durable_capacity;
 
 const DEFAULT_MAX_DELIVERY_ATTEMPTS: u32 = 3;
 
@@ -809,6 +810,13 @@ impl KubernetesNodeLifecycleEvent {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("capacity") {
+        if let Err(error) = capacity_command() {
+            eprintln!("capacity command failed: {error}");
+            std::process::exit(2);
+        }
+        return;
+    }
     let config = OrchestratorConfig::from_env();
 
     println!("athernex orchestrator preparation mode");
@@ -892,6 +900,58 @@ fn main() {
     ) {
         println!("sample_idle_decision={}", describe_decision(&decision));
     }
+}
+
+fn capacity_command() -> Result<(), Box<dyn std::error::Error>> {
+    use durable_capacity::{Decision, DurableCapacity};
+    let args = std::env::args().skip(2).collect::<Vec<_>>();
+    if args.len() < 4 {
+        return Err("usage: orchestrator capacity DB RESOURCE CAPACITY reserve OWNER REQUESTED_SLOTS TTL_MS | release OWNER GENERATION | status".into());
+    }
+    let mut ledger = DurableCapacity::open(std::path::Path::new(&args[0]))?;
+    let resource = &args[1];
+    let slots: u32 = args[2].parse()?;
+    if !ledger.configure(resource, slots)? {
+        return Err("resource capacity conflicts with existing ledger".into());
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64;
+    let result = match args[3].as_str() {
+        "reserve" if args.len() == 7 => {
+            let requested_slots: u32 = args[5].parse()?;
+            let ttl_ms: i64 = args[6].parse()?;
+            match ledger.reserve(&args[4], resource, requested_slots, now_ms, ttl_ms)? {
+                Decision::Granted(lease) => {
+                    serde_json::json!({"version":1,"decision":"granted","resource":resource,"owner":lease.owner,"generation":lease.generation,"expires_ms":lease.expires_ms})
+                }
+                Decision::Duplicate(lease) => {
+                    serde_json::json!({"version":1,"decision":"duplicate","resource":resource,"owner":lease.owner,"generation":lease.generation,"expires_ms":lease.expires_ms})
+                }
+                Decision::Refused(reason) => {
+                    serde_json::json!({"version":1,"decision":"refused","reason":reason,"resource":resource})
+                }
+            }
+        }
+        "release" if args.len() == 6 => {
+            let generation: i64 = args[5].parse()?;
+            let decision = ledger.release(&args[4], resource, generation, now_ms)?;
+            serde_json::json!({"version":1,"decision":decision,"resource":resource,"generation":generation})
+        }
+        "status" if args.len() == 4 => {
+            let active = ledger.active(resource, now_ms)?;
+            serde_json::json!({"version":1,"resource":resource,"active":active.iter().map(|l| serde_json::json!({"owner":l.owner,"slots":l.slots,"generation":l.generation,"expires_ms":l.expires_ms})).collect::<Vec<_>>()})
+        }
+        _ => return Err("invalid capacity command arguments".into()),
+    };
+    println!("{result}");
+    if matches!(
+        result["decision"].as_str(),
+        Some("refused" | "stale_generation" | "expired_lease")
+    ) {
+        std::process::exit(3);
+    }
+    Ok(())
 }
 
 fn sample_kafka_contract(config: &OrchestratorConfig) -> Vec<MessageEnvelope> {

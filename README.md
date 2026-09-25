@@ -47,6 +47,26 @@ Core principles:
 
 ## Local Staging
 
+### Durable local capacity admission
+
+`orchestrator capacity` uses an SQLite WAL ledger. Admission and release run in
+immediate transactions, so separate processes share one capacity limit and a
+monotonic generation. Replayed reservations return the original lease; expired
+leases cannot release a replacement. A refusal exits with status 3 and emits
+JSON with a reason code.
+
+```bash
+cargo run -p orchestrator -- capacity target/capacity.sqlite3 local 2 reserve job-1 1 60000
+cargo run -p orchestrator -- capacity target/capacity.sqlite3 local 2 status
+```
+
+The existing no-argument scheduler demonstration still uses its in-memory
+fixture. Deployments must invoke the durable admission interface before
+publishing local execution commands; Kafka publication itself is not an atomic
+transaction with the SQLite commit. The typed Paperclip review adapter is a
+public-safe contract and fixture, not a connection to a private Paperclip
+server. It requires explicit approval before any future remote action path.
+
 Requirements:
 
 - Docker with Compose support
